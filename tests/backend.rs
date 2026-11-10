@@ -132,9 +132,10 @@ fn batched_quantized_gemm_uses_prepared_x() {
     use rusting_strata::backend::SAME_X;
     use rusting_strata::quant::GgmlType;
     use rusting_strata::weights::Tensor;
+    use std::borrow::Cow;
 
     let data = include_bytes!("fixtures/Q4_K.raw").repeat(8);
-    let weight = Tensor { ty: GgmlType::Q4K, cols: 256, rows: 64, data: &data };
+    let weight = Tensor { ty: GgmlType::Q4K, cols: 256, rows: 64, data: Cow::Borrowed(&data) };
     assert_eq!(data.len(), weight.ty.row_bytes(256) * 64);
     let n = 128;
     let input: Vec<f32> = (0..n * 256).map(|i| (i % 127) as f32 / 63.0 - 1.0).collect();

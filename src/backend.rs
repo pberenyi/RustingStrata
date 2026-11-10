@@ -138,20 +138,20 @@ pub trait Backend: Send {
         match upload_type(t.ty) {
             GgmlType::F32 if t.ty == GgmlType::F16 => {
                 let mut f = vec![0f32; t.rows * t.cols];
-                crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
+                crate::quant::dequant_row(GgmlType::F16, t.data.as_ref(), &mut f);
                 let b = self.alloc(4 * f.len())?;
                 self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
                 Ok(GpuTensor::new(GgmlType::F32, t.rows, t.cols, b))
             }
             GgmlType::Q8_0 if matches!(t.ty, GgmlType::Q4_0 | GgmlType::Q5_0) => {
-                let q = crate::quant::to_q8_0(t.ty, t.data);
+                let q = crate::quant::to_q8_0(t.ty, t.data.as_ref());
                 let b = self.alloc(q.len())?;
                 self.htod(&q, &b, 0)?;
                 Ok(GpuTensor::new(GgmlType::Q8_0, t.rows, t.cols, b))
             }
             ty => {
                 let b = self.alloc(t.data.len())?;
-                self.htod(t.data, &b, 0)?;
+                self.htod(t.data.as_ref(), &b, 0)?;
                 Ok(GpuTensor::new(ty, t.rows, t.cols, b))
             }
         }

@@ -858,22 +858,31 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
 
 /// Weighted sum of the given routed experts of layer `il` applied to `h` (no router, no shared expert).
 pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32> {
+    experts_cached(m, il, h, sel, &crate::cpu_worker::CpuExpertCache::default())
+}
+
+pub fn experts_cached(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)], cache: &crate::cpu_worker::CpuExpertCache) -> Vec<f32> {
     let c = &m.cfg;
     let mut y = vec![0f32; c.n_embd];
     if sel.is_empty() { return y; }
-    let t = |s: &str| m.w.layer(il, s).unwrap_or_else(|e| panic!("{e:#}"));
-    let (gate, up, down) = (t("ffn_gate_exps.weight"), t("ffn_up_exps.weight"), t("ffn_down_exps.weight"));
-    let (n, ff, k) = (c.n_expert, c.n_ff_exp, sel.len());
+    let (ff, k) = (c.n_ff_exp, sel.len());
     // Gate and up of every expert in one parallel pass (gate and up share a type in all supported files).
-    let gu: Vec<Tensor> = sel.iter().flat_map(|&(e, _)| [gate.expert(e, n), up.expert(e, n)]).collect();
+    let expert = |name: &str, e: usize| match cache.expert(m, il, name, e) {
+        Some(t) => t,
+        None => m.w.expert(il, name, e).unwrap_or_else(|err| panic!("{err:#}")),
+    };
+    let gu: Vec<Tensor> = sel.iter().flat_map(|&(e, _)| [
+        expert("ffn_gate_exps.weight", e),
+        expert("ffn_up_exps.weight", e),
+    ]).collect();
     let mut a = vec![0f32; 2 * k * ff];
-    if gate.ty == up.ty {
+    if gu[0].ty == gu[1].ty {
         batch_rows(&gu, &[h], &mut a);
     } else {
         for (i, t) in gu.iter().enumerate() { matvec(t, h, &mut a[i * ff..(i + 1) * ff]); }
     }
     let acts: Vec<Vec<f32>> = a.chunks_exact(2 * ff).map(|g| (0..ff).map(|i| ops::silu(g[i]) * g[ff + i]).collect()).collect();
-    let ds: Vec<Tensor> = sel.iter().map(|&(e, _)| down.expert(e, n)).collect();
+    let ds: Vec<Tensor> = sel.iter().map(|&(e, _)| expert("ffn_down_exps.weight", e)).collect();
     let mut o = vec![0f32; k * c.n_embd];
     batch_rows(&ds, &acts.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
     for (j, &(e, _)) in sel.iter().enumerate() {
@@ -888,6 +897,7 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     /// Batch boundaries can cross matrices; both Q2_0 and the f32 fallback must use the right input row.
     #[test]
@@ -909,7 +919,7 @@ mod tests {
                 }
                 v
             }).collect();
-            let mats: Vec<Tensor> = data.iter().map(|d| Tensor { ty, cols, rows, data: d }).collect();
+            let mats: Vec<Tensor> = data.iter().map(|d| Tensor { ty, cols, rows, data: Cow::Borrowed(d) }).collect();
             let xs: Vec<&[f32]> = inputs.iter().map(Vec::as_slice).collect();
             let mut got = vec![0.0; rows * count];
             pool.install(|| batch_rows(&mats, &xs, &mut got));

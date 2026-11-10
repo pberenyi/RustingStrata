@@ -22,6 +22,9 @@ struct Engine {
     /// Run on the GPU (experts that do not fit in VRAM run on the CPU) instead of the CPU reference.
     #[arg(long)]
     gpu: bool,
+    /// Read GGUF tensors on demand instead of retaining file mappings (lower working set; CPU expert reads may be slower).
+    #[arg(long)]
+    no_mmap: bool,
     /// GPU context length (KV cache size) in tokens.
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
@@ -225,6 +228,10 @@ impl Runner<'_> {
 }
 
 impl Engine {
+    fn open_model(&self, model: &Path) -> anyhow::Result<Gguf> {
+        Gguf::open_with_mmap(model, !self.no_mmap)
+    }
+
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
@@ -533,6 +540,9 @@ enum Cmd {
     Calibrate {
         #[arg(long)]
         model: PathBuf,
+        /// Read GGUF tensors on demand instead of retaining file mappings.
+        #[arg(long)]
+        no_mmap: bool,
         /// GPU context length used while measuring and assumed for the results.
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
@@ -657,7 +667,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             };
             let (prompt, cont) = (ids("prompt")?, ids("continuation")?);
             anyhow::ensure!(!prompt.is_empty() && !cont.is_empty(), "empty prompt or continuation");
-            let g = Gguf::open(&model)?;
+            let g = engine.open_model(&model)?;
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             if let Some(&t) = prompt.iter().chain(&cont).find(|&&t| t as usize >= m.cfg.n_vocab) {
@@ -678,7 +688,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             println!("{}", serde_json::json!({"argmax": argmax, "top5": top5}));
         }
         Cmd::Generate { model, prompt, n, mut engine } => {
-            let g = Gguf::open(&model)?;
+            let g = engine.open_model(&model)?;
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
@@ -708,7 +718,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
-            let g = Gguf::open(&model)?;
+            let g = engine.open_model(&model)?;
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
@@ -744,7 +754,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Bench { model, pp, tg, reps, json_out, mut engine } => {
-            let g = Gguf::open(&model)?;
+            let g = engine.open_model(&model)?;
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
@@ -798,10 +808,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 std::fs::write(&path, line).with_context(|| format!("writing the JSON record to {}", path.display()))?;
             }
         }
-        Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
+        Cmd::Calibrate { model, no_mmap, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
             if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
-            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
+            calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device, no_mmap)?
         }
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
@@ -814,7 +824,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             b.preflight(&types, true)?;
         }
         Cmd::Chat { model, system, n, think, mut engine } => {
-            let g = Gguf::open(&model)?;
+            let g = engine.open_model(&model)?;
             let mut m = Model::load(&g)?;
             if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; }
             let tok = Tokenizer::from_gguf(&g)?;
@@ -1040,18 +1050,21 @@ fn prose(tok: &Tokenizer, n: usize) -> anyhow::Result<Vec<u32>> {
 }
 
 /// Best (lowest) of three timings of `f`, in seconds.
-fn best(f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
+fn best(label: &str, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<f64> {
     let mut b = f64::INFINITY;
-    for _ in 0..3 {
+    for run in 1..=3 {
+        eprintln!("calibrate: {label}, run {run}/3");
         let t = Instant::now();
         f()?;
-        b = b.min(t.elapsed().as_secs_f64());
+        let elapsed = t.elapsed().as_secs_f64();
+        eprintln!("calibrate: {label}, run {run}/3 finished in {elapsed:.1}s");
+        b = b.min(elapsed);
     }
     Ok(b)
 }
 
-fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize) -> anyhow::Result<()> {
-    let g = Gguf::open(model)?;
+fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device: usize, no_mmap: bool) -> anyhow::Result<()> {
+    let g = Gguf::open_with_mmap(model, !no_mmap)?;
     let m = Model::load(&g)?;
     let tok = Tokenizer::from_gguf(&g)?;
     let n_pf = 4096.min(ctx.saturating_sub(256));
@@ -1065,9 +1078,10 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
 
     let mut chunk = (0, 0.0);
     for c in [512, 1024, 2048, 4096].into_iter().filter(|&c| c <= ctx) {
+        eprintln!("calibrate: loading prefill chunk {c} ({n_pf} prompt tokens)");
         // A larger chunk's prefill scratch may not fit beside a long --ctx: keep the chunks measured so far.
         let mut gm = match load(c) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { eprintln!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
-        let t = best(&mut || { gm.reset()?; gm.prefill(&pf).map(drop) })?;
+        let t = best(&format!("chunk {c}, prefill"), &mut || { gm.reset()?; gm.prefill(&pf).map(drop) })?;
         let tps = n_pf as f64 / t;
         eprintln!("chunk {c:5}: prefill {n_pf} tok {tps:.0} tok/s");
         if tps > chunk.1 { chunk = (c, tps); }
@@ -1078,9 +1092,9 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     for n in [8, 16, 32, 64, 128] {
         let p = &pf[..n];
         gm.short = usize::MAX;
-        let ts = best(&mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
+        let ts = best(&format!("prompt {n}, token-by-token"), &mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
         gm.short = 0;
-        let tb = best(&mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
+        let tb = best(&format!("prompt {n}, batched"), &mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
         eprintln!("prompt {n:4}: steps {:.1} ms, batched {:.1} ms", ts * 1e3, tb * 1e3);
         if tb < ts && short == usize::MAX { short = n; }
     }
@@ -1093,7 +1107,7 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     for k in 0..=kmax {
         if let Runner::Gpu(g) = &mut r { g.k = k.max(1); }
         let mut toks = 0;
-        let t = best(&mut || {
+        let t = best(&format!("MTP {k}, decode"), &mut || {
             r.reset()?;
             let l = r.prefill(&dec)?;
             toks = decode(&mut r, &tok, k > 0, &mut Sampler::greedy(), l, 128, &mut |_| Ok(false))?.0.len();
@@ -1442,7 +1456,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
         st.unload(Some(name.clone()));
         st.ctx = engine.ctx;
     }
-    let g = Gguf::open(model)?;
+    let g = engine.open_model(model)?;
     let arch = g.get("general.architecture")?.as_str().context("general.architecture")?;
     s.stats.lock().unwrap().ctx_train = g.meta.get(&format!("{arch}.context_length")).and_then(|v| v.as_u64());
     let mut m = Model::load(&g)?;

@@ -6,6 +6,10 @@
 
 use crate::model::Model;
 use crate::backend::{Backend, Buf};
+use crate::weights::{ExpertCacheReservation, Tensor, available_ram, expert_cache_ram_capacity};
+use anyhow::Context;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -24,6 +28,137 @@ pub const IDS: usize = 32;
 
 /// Most tokens one request may carry.
 pub const TMAX: usize = 4;
+
+struct CachedExpert { mats: [Box<[u8]>; 3], bytes: usize, _reservation: Option<ExpertCacheReservation> }
+
+#[derive(Default)]
+pub struct CpuExpertCache {
+    entries: HashMap<(usize, usize), CachedExpert>,
+    lru: VecDeque<(usize, usize)>,
+    used: usize,
+    budget: usize,
+    layer_quota: usize,
+    layer_used: HashMap<usize, usize>,
+    reported_bucket: Option<usize>,
+}
+
+impl CpuExpertCache {
+    fn new(m: &Model, moe_layers: &[usize]) -> CpuExpertCache {
+        if m.w.g.uses_mmap() {
+            eprintln!("CPU expert RAM cache: disabled because GGUF memory mapping is enabled; use --no-mmap to enable it");
+            return CpuExpertCache::default();
+        }
+        let Some(budget) = expert_cache_ram_capacity() else {
+            eprintln!("CPU expert RAM cache: physical-memory availability is unknown; reading uncached experts from disk");
+            return CpuExpertCache::default();
+        };
+        let available = available_ram().map_or(0, |(_, available)| available);
+        let layer_count = moe_layers.iter().copied().collect::<HashSet<_>>().len();
+        let layer_quota = if layer_count == 0 { 0 } else { budget / layer_count };
+        eprintln!(
+            "CPU expert RAM cache: LRU enabled for CPU-routed decode misses, capacity {:.0} MB across {} MoE layers ({:.0} MB fair share per layer; unused share is borrowable; {:.0} MB available, reserving 5% of physical RAM; GPU prefill uses separate staging)",
+            budget as f64 / 1048576.0,
+            layer_count,
+            layer_quota as f64 / 1048576.0,
+            available as f64 / 1048576.0,
+        );
+        CpuExpertCache { budget, layer_quota, ..CpuExpertCache::default() }
+    }
+
+    fn prepare(&mut self, m: &Model, il: usize, experts: &[usize]) -> anyhow::Result<()> {
+        let active: HashSet<_> = experts.iter().map(|&e| (il, e)).collect();
+        let mut unique = HashSet::new();
+        for &e in experts {
+            if !unique.insert(e) { continue; }
+            let key = (il, e);
+            if self.entries.contains_key(&key) {
+                self.lru.retain(|&k| k != key);
+                self.lru.push_back(key);
+                continue;
+            }
+            if self.budget == 0 { continue; }
+            let mut size = 0usize;
+            for name in crate::expert_cache::MATS {
+                size = size.checked_add(m.w.expert_shape(il, name)?.3)
+                    .context("CPU expert size overflow")?;
+            }
+            if size > self.budget { continue; }
+            if !self.make_room(size, il, &active) { continue; }
+            let Some(reservation) = ExpertCacheReservation::new(size) else { continue };
+
+            let mats = (|| -> anyhow::Result<[Box<[u8]>; 3]> {
+                let mut mats = Vec::with_capacity(crate::expert_cache::MATS.len());
+                for name in crate::expert_cache::MATS {
+                    mats.push(m.w.expert(il, name, e)?.data.into_owned().into_boxed_slice());
+                }
+                mats.try_into().map_err(|_| anyhow::anyhow!("expected three CPU expert matrices"))
+            })();
+            let mats = match mats {
+                Ok(mats) => mats,
+                Err(err) => return Err(err),
+            };
+            self.entries.insert(key, CachedExpert { mats, bytes: size, _reservation: Some(reservation) });
+            self.lru.push_back(key);
+            self.used += size;
+            *self.layer_used.entry(il).or_default() += size;
+        }
+        let bucket = self.used / (128 << 20);
+        if self.used > 0 && self.reported_bucket != Some(bucket) {
+            eprintln!(
+                "CPU expert RAM cache: {:.0} MB in use / {:.0} MB capacity ({} experts cached)",
+                self.used as f64 / 1048576.0,
+                self.budget as f64 / 1048576.0,
+                self.entries.len(),
+            );
+            self.reported_bucket = Some(bucket);
+        }
+        Ok(())
+    }
+
+    fn layer_limit(&self, layer: usize) -> usize {
+        let borrowed = self.layer_used.iter()
+            .filter(|(other, _)| **other != layer)
+            .fold(0usize, |sum, (_, &used)| sum.saturating_add(used.min(self.layer_quota)));
+        self.budget.saturating_sub(borrowed)
+    }
+
+    fn evict_at(&mut self, index: usize) {
+        let key = self.lru.remove(index).unwrap();
+        if let Some(old) = self.entries.remove(&key) {
+            self.used -= old.bytes;
+            let layer_bytes = self.layer_used.get_mut(&key.0).unwrap();
+            *layer_bytes -= old.bytes;
+            if *layer_bytes == 0 { self.layer_used.remove(&key.0); }
+        }
+    }
+
+    fn make_room(&mut self, size: usize, layer: usize, active: &HashSet<(usize, usize)>) -> bool {
+        loop {
+            let layer_used = self.layer_used.get(&layer).copied().unwrap_or(0);
+            if layer_used.checked_add(size).is_none_or(|next| next > self.layer_limit(layer)) {
+                let Some(i) = self.lru.iter().position(|key| key.0 == layer && !active.contains(key)) else { return false };
+                self.evict_at(i);
+                continue;
+            }
+            if self.used.checked_add(size).is_some_and(|next| next <= self.budget) { return true; }
+
+            let over_quota = self.lru.iter().position(|key| {
+                !active.contains(key)
+                    && self.layer_used.get(&key.0).copied().unwrap_or(0) > self.layer_quota
+            });
+            let Some(i) = over_quota.or_else(|| self.lru.iter().position(|key| !active.contains(key))) else { return false };
+            self.evict_at(i);
+        }
+    }
+
+    pub fn expert<'a>(&'a self, m: &Model, il: usize, suffix: &str, e: usize) -> Option<Tensor<'a>> {
+        let i = crate::expert_cache::MATS.iter().position(|&name| name == suffix)?;
+        let cached = self.entries.get(&(il, e))?;
+        let data = cached.mats.get(i)?;
+        let (ty, rows, cols, _) = m.w.expert_shape(il, suffix).ok()?;
+        Some(Tensor { ty, rows, cols, data: Cow::Borrowed(data) })
+    }
+}
 
 /// Per layer: ids, weights and slots for up to TMAX tokens of `k` entries (token t at t * k; the three arrays are
 /// each NTOK * k long), then TMAX activations of `n` floats at `h` and TMAX results at `y`.
@@ -54,6 +189,7 @@ impl CpuWorker {
     /// Mailboxes cover layers up to the largest of `moe_layers`. Safety: `m` must outlive the worker (it is joined on drop).
     pub fn new(m: &Model, gpu: &dyn Backend, moe_layers: Vec<usize>) -> anyhow::Result<CpuWorker> {
         let c = &m.cfg;
+        let mut ram_cache = CpuExpertCache::new(m, &moe_layers);
         let layout = Mailbox::new(c.n_expert_used, c.n_embd);
         let len = layout.stride * moe_layers.iter().max().map_or(0, |&il| il + 1);
         let (mem, host) = gpu.host_mailbox(len)?;
@@ -74,8 +210,8 @@ impl CpuWorker {
             .thread_name(|i| format!("strata-experts-{i}")).build()?;
         let thread = std::thread::Builder::new().name("strata-cpu-experts".into()).spawn(move || pool.install(move || {
             let m = unsafe { &*(mp as *const Model) };
-            // Missed experts not in the page cache are read from the drive: reading all of a layer's ahead keeps
-            // the reads in flight together instead of one page fault at a time per compute thread.
+            // Experts outside the RAM and VRAM caches are read from the drive: reading the next layer's misses
+            // together keeps storage reads in flight instead of issuing one read at a time per compute thread.
             let pre = crate::weights::Prefetch::start();
             let w = |i: usize| host as *mut u32 as usize + 4 * i;
             while let Ok(seq) = rx.recv() {
@@ -104,11 +240,12 @@ impl CpuWorker {
                     let mut v = vec![0u32; (3 * kt).next_multiple_of(4)];
                     unsafe { read_wc(at(IDS), &mut v) };
                     let missed: Vec<usize> = (0..kt).filter(|&j| (v[2 * kt + j] as i32) < 0).map(|j| v[j] as usize).collect();
-                    if !missed.is_empty() {
+                    if let Err(e) = ram_cache.prepare(m, il, &missed) { panic!("preparing CPU expert RAM cache: {e:#}"); }
+                    if !missed.is_empty() && m.w.g.uses_mmap() {
                         // Gate and up first: they are read first.
                         pre.send(["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter()
-                            .filter_map(|s| m.w.layer(il, s).ok())
-                            .flat_map(|t| missed.iter().map(move |&e| { let d = t.expert(e, m.cfg.n_expert).data; (d.as_ptr() as usize, d.len()) }).collect::<Vec<_>>())
+                            .flat_map(|s| missed.iter().filter_map(move |&e| m.w.expert(il, s, e).ok())
+                                .map(|t| (t.data.as_ptr() as usize, t.data.len())).collect::<Vec<_>>())
                             .collect());
                     }
                     for t in 0..nt {
@@ -118,7 +255,7 @@ impl CpuWorker {
                         let mut h = vec![0u32; n];
                         unsafe { read_wc(at(lay.h + t * n), &mut h) };
                         let h: Vec<f32> = h.into_iter().map(f32::from_bits).collect();
-                        let y = crate::cpu_moe::experts(m, il, &h, &sel);
+                        let y = crate::cpu_moe::experts_cached(m, il, &h, &sel, &ram_cache);
                         unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
                     }
                     // SeqCst fences (mfence on x86) also order and flush write-combining stores (Vulkan maps the
@@ -191,5 +328,86 @@ impl Drop for CpuWorker {
         self.stop.store(true, Ordering::Relaxed);
         self.tx = None;
         if let Some(t) = self.thread.take() { let _ = t.join(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expert() -> CachedExpert {
+        CachedExpert {
+            mats: [vec![0].into_boxed_slice(), vec![0].into_boxed_slice(), vec![0].into_boxed_slice()],
+            bytes: 4,
+            _reservation: None,
+        }
+    }
+
+    fn insert(cache: &mut CpuExpertCache, key: (usize, usize)) {
+        cache.entries.insert(key, expert());
+        cache.lru.push_back(key);
+        cache.used += 4;
+        *cache.layer_used.entry(key.0).or_default() += 4;
+    }
+
+    #[test]
+    fn cpu_expert_cache_evicts_lru_but_keeps_current_batch() {
+        let (old, active) = ((0, 1), (0, 2));
+        let mut cache = CpuExpertCache { budget: 8, ..CpuExpertCache::default() };
+        insert(&mut cache, old);
+        insert(&mut cache, active);
+
+        assert!(cache.make_room(4, 0, &HashSet::from([active])));
+        assert!(!cache.entries.contains_key(&old));
+        assert!(cache.entries.contains_key(&active));
+        assert_eq!(cache.used, 4);
+        assert_eq!(cache.layer_used.get(&0), Some(&4));
+    }
+
+    #[test]
+    fn cpu_expert_cache_does_not_evict_experts_in_current_batch() {
+        let (a, b) = ((0, 1), (0, 2));
+        let mut cache = CpuExpertCache { budget: 8, ..CpuExpertCache::default() };
+        insert(&mut cache, a);
+        insert(&mut cache, b);
+
+        assert!(!cache.make_room(4, 0, &HashSet::from([a, b])));
+        assert!(cache.entries.contains_key(&a) && cache.entries.contains_key(&b));
+        assert_eq!(cache.used, 8);
+    }
+
+    #[test]
+    fn cpu_expert_cache_reclaims_borrowed_share_for_other_layers() {
+        let mut cache = CpuExpertCache {
+            budget: 16,
+            layer_quota: 8,
+            ..CpuExpertCache::default()
+        };
+        for expert in 0..3 {
+            insert(&mut cache, (0, expert));
+        }
+
+        assert_eq!(cache.layer_limit(1), 8);
+        assert!(cache.make_room(8, 1, &HashSet::new()));
+        assert_eq!(cache.used, 8);
+        assert_eq!(cache.layer_used.get(&0), Some(&8));
+        assert!(!cache.entries.contains_key(&(0, 0)));
+    }
+
+    #[test]
+    fn cpu_expert_cache_stays_within_layer_quota_when_others_are_full() {
+        let mut cache = CpuExpertCache {
+            budget: 16,
+            layer_quota: 8,
+            ..CpuExpertCache::default()
+        };
+        insert(&mut cache, (0, 0));
+        insert(&mut cache, (0, 1));
+        insert(&mut cache, (1, 0));
+        insert(&mut cache, (1, 1));
+
+        assert!(cache.make_room(4, 0, &HashSet::new()));
+        assert_eq!(cache.layer_used.get(&0), Some(&4));
+        assert_eq!(cache.layer_used.get(&1), Some(&8));
     }
 }

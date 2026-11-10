@@ -1,6 +1,8 @@
-//! GGUF v2/v3 parser over a memory map.
+//! GGUF v2/v3 parser over a memory map or positioned file reads.
 
 use anyhow::{Context, bail};
+use std::borrow::Cow;
+use std::fs::File;
 use memmap2::Mmap;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -36,9 +38,12 @@ pub struct TensorInfo { pub name: String, pub dims: Vec<u64>, pub ty: u32, pub o
 pub struct Gguf {
     pub meta: BTreeMap<String, Value>,
     pub tensors: BTreeMap<String, TensorInfo>,
-    /// Each shard's map and data offset (one entry unless the model is split).
-    files: Vec<(Mmap, usize)>,
+    /// Each shard's optional map, open file and data offset (one entry unless split).
+    files: Vec<GgufFile>,
+    mmap: bool,
 }
+
+struct GgufFile { mmap: Option<Mmap>, file: File, data_offset: usize }
 
 struct Cur<'a> { b: &'a [u8], p: usize }
 
@@ -85,14 +90,20 @@ impl Gguf {
     /// Open a GGUF; for a split model (`split.count` > 1), pass the `-00001-of-0000N` shard and the others are
     /// opened from the same directory.
     pub fn open(path: &Path) -> anyhow::Result<Gguf> {
-        let mut g = Self::open_one(path, 0)?;
+        Self::open_with_mmap(path, true)
+    }
+
+    /// Open a GGUF while reading tensor bytes from the files on demand instead of retaining file mappings.
+    pub fn open_with_mmap(path: &Path, mmap: bool) -> anyhow::Result<Gguf> {
+        let mut g = Self::open_one(path, 0, mmap)?;
+        g.mmap = mmap;
         let n = g.meta.get("split.count").and_then(Value::as_u64).unwrap_or(1) as usize;
         if n > 1 {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let tag = format!("-00001-of-{n:05}.gguf");
             let stem = name.strip_suffix(&tag).with_context(|| format!("{}: split model; open its first shard (*{tag})", path.display()))?;
             for i in 1..n {
-                let s = Self::open_one(&path.with_file_name(format!("{stem}-{:05}-of-{n:05}.gguf", i + 1)), i)?;
+                let s = Self::open_one(&path.with_file_name(format!("{stem}-{:05}-of-{n:05}.gguf", i + 1)), i, mmap)?;
                 g.files.extend(s.files);
                 for (k, t) in s.tensors { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
             }
@@ -100,8 +111,8 @@ impl Gguf {
         Ok(g)
     }
 
-    fn open_one(path: &Path, file: usize) -> anyhow::Result<Gguf> {
-        let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    fn open_one(path: &Path, file: usize, keep_mmap: bool) -> anyhow::Result<Gguf> {
+        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&f)? };
         let mut c = Cur { b: &mmap, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }
@@ -133,19 +144,63 @@ impl Gguf {
                 bail!("{}: GGUF truncated (tensor {} lies past the end of the file; re-download it)", path.display(), t.name);
             }
         }
-        Ok(Gguf { meta, tensors, files: vec![(mmap, data_offset)] })
+        let map = keep_mmap.then_some(mmap);
+        Ok(Gguf { meta, tensors, files: vec![GgufFile { mmap: map, file: f, data_offset }], mmap: keep_mmap })
     }
 
     pub fn get(&self, key: &str) -> anyhow::Result<&Value> {
         self.meta.get(key).with_context(|| format!("missing GGUF key {key}"))
     }
 
-    /// Raw bytes of a tensor. Panics on an unsupported type; `Weights::validate` checks types first.
-    pub fn bytes(&self, t: &TensorInfo) -> &[u8] {
+    pub fn uses_mmap(&self) -> bool { self.mmap }
+
+    /// Raw bytes of a tensor. Mapped models borrow the mapping; no-mmap models read the bytes into an owned buffer.
+    pub fn bytes(&self, t: &TensorInfo) -> anyhow::Result<Cow<'_, [u8]>> {
         let ty = GgmlType::from_u32(t.ty).unwrap();
         let n = ty.row_bytes(t.dims[0]) * t.dims[1..].iter().product::<u64>() as usize;
-        let (mmap, data_offset) = &self.files[t.file];
-        let o = data_offset + t.offset as usize;
-        &mmap[o..o + n]
+        self.bytes_range(t, 0, n)
     }
+
+    /// Read a range within a tensor, using the mapping when enabled and positioned file I/O otherwise.
+    pub fn bytes_range(&self, t: &TensorInfo, offset: usize, len: usize) -> anyhow::Result<Cow<'_, [u8]>> {
+        let ty = GgmlType::from_u32(t.ty).unwrap();
+        let total = ty.row_bytes(t.dims[0]) * t.dims[1..].iter().product::<u64>() as usize;
+        let end = offset.checked_add(len).context("tensor range overflow")?;
+        anyhow::ensure!(end <= total, "tensor {} range {offset}..{end} exceeds {total} bytes", t.name);
+        let shard = &self.files[t.file];
+        let o = shard.data_offset.checked_add(t.offset as usize).and_then(|x| x.checked_add(offset))
+            .context("GGUF tensor offset overflow")?;
+        if let Some(mmap) = &shard.mmap {
+            return Ok(Cow::Borrowed(&mmap[o..o + len]));
+        }
+        let mut data = vec![0u8; len];
+        read_at(&shard.file, &mut data, o as u64)?;
+        Ok(Cow::Owned(data))
+    }
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file.seek_read(&mut buf[read..], offset)?;
+        if n == 0 { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+        read += n;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut read = 0;
+    while read < buf.len() {
+        let n = file.read_at(&mut buf[read..], offset)?;
+        if n == 0 { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+        read += n;
+        offset += n as u64;
+    }
+    Ok(())
 }

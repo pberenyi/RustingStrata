@@ -30,20 +30,31 @@ fn parses_synthetic_file() {
     let p = std::env::temp_dir().join(format!("strata-{}-syn.gguf", std::process::id()));
     std::fs::write(&p, &b).unwrap();
     let g = Gguf::open(&p).unwrap();
-    std::fs::remove_file(&p).ok();
     // Cut 4 bytes off the tensor data: a clean error, not a panic in `bytes`. A new path, since `g` maps the file.
     let cut = p.with_extension("cut.gguf");
     std::fs::write(&cut, &b[..b.len() - 4]).unwrap();
     let e = Gguf::open(&cut).err().unwrap();
-    std::fs::remove_file(&cut).ok();
     assert!(format!("{e}").contains("GGUF truncated (tensor t "), "{e}");
     assert_eq!(g.get("general.architecture").unwrap().as_str(), Some("qwen35moe"));
     assert_eq!(g.get("qwen35moe.block_count").unwrap().as_u64(), Some(41));
     let t = &g.tensors["t"];
     assert_eq!(t.dims, vec![4, 2]);
-    let bytes = g.bytes(t);
+    let bytes = g.bytes(t).unwrap();
     assert_eq!(bytes.len(), 32);
     assert_eq!(f32::from_le_bytes(bytes[28..32].try_into().unwrap()), 8.0);
+    drop(g);
+    let g2 = Gguf::open_with_mmap(&p, false).unwrap();
+    assert!(!g2.uses_mmap());
+    let t = &g2.tensors["t"];
+    let bytes = g2.bytes(t).unwrap();
+    assert_eq!(bytes.len(), 32);
+    assert_eq!(f32::from_le_bytes(bytes[28..32].try_into().unwrap()), 8.0);
+    let range = g2.bytes_range(t, 8, 8).unwrap();
+    assert_eq!(f32::from_le_bytes(range[0..4].try_into().unwrap()), 3.0);
+    assert_eq!(f32::from_le_bytes(range[4..8].try_into().unwrap()), 4.0);
+    drop(g2);
+    std::fs::remove_file(&p).ok();
+    std::fs::remove_file(&cut).ok();
 }
 
 #[test]
@@ -59,7 +70,7 @@ fn real_file_config() {
     assert_eq!(&c.layers[..4], &[LayerKind::Delta, LayerKind::Delta, LayerKind::Delta, LayerKind::Attn]);
     assert!(c.q_gate && !c.k_interleave);
     // IQ3_XXS: 98 bytes per 256 elements; [512, 2048, 256].
-    assert_eq!(g.bytes(&g.tensors["blk.0.ffn_down_exps.weight"]).len(), 2048 * 256 * 2 * 98);
+    assert_eq!(g.bytes(&g.tensors["blk.0.ffn_down_exps.weight"]).unwrap().len(), 2048 * 256 * 2 * 98);
 }
 
 /// Arch-table fields of whichever model STRATA_MODEL names; canonical tensor names resolve through the aliases.
@@ -186,7 +197,7 @@ fn opens_split_model() {
     std::fs::remove_dir(&d).ok();
     assert!(format!("{e}").contains("open its first shard"), "{e}");
     for (n, v) in [("a", 1.5f32), ("b", 2.5)] {
-        assert_eq!(f32::from_le_bytes(g.bytes(&g.tensors[n])[12..16].try_into().unwrap()), v, "{n}");
+        assert_eq!(f32::from_le_bytes(g.bytes(&g.tensors[n]).unwrap()[12..16].try_into().unwrap()), v, "{n}");
     }
 }
 

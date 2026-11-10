@@ -1,6 +1,7 @@
 //! Kernel tests, run on every backend that opens (`common::backends`).
 mod common;
 use common::{down, up};
+use std::borrow::Cow;
 use rusting_strata::backend::{Backend, ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor, SAME_X};
 use rusting_strata::{cuda::Gpu, gguf::Gguf, quant::GgmlType, weights::{Tensor, Weights}};
 
@@ -185,7 +186,7 @@ fn gemvn_matches_gemv() {
                 assert_eq!(down::<f32>(gpu, &dz), want[..nt * t.rows], "{} {name} gemvq2 b nt {nt}", ty.name());
                 // A shorter first matrix (its first r2 rows): the pair still covers both.
                 let r2 = t.rows.div_ceil(2);
-                let dh = gpu.upload(&Tensor { rows: r2, data: &t.data[..t.data.len() / t.rows * r2], ..t }).unwrap();
+                let dh = gpu.upload(&Tensor { rows: r2, data: Cow::Borrowed(&t.data[..t.data.len() / t.rows * r2]), ..t }).unwrap();
                 let (dy, dz) = (gpu.zeros::<f32>(nt * r2).unwrap(), gpu.zeros::<f32>(nt * t.rows).unwrap());
                 gpu.gemvq2(&dh, &dt, dx.addr(), t.cols, xq.addr(), dy.addr(), dz.addr(), nt).unwrap();
                 let short: Vec<f32> = want.chunks(t.rows).take(nt).flat_map(|r| r[..r2].to_vec()).collect();
@@ -1428,10 +1429,10 @@ fn gemv_partial_superblocks_and_q2_0() {
                 if cols % ty.block_elems() != 0 { continue; }
                 let (rows, nt, ne) = (40, 3, 4);  // ne experts of `rows` rows for moe_gemv
                 let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
-                let all = Tensor { ty, cols, rows: ne * rows, data: &data };
-                let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
+                let all = Tensor { ty, cols, rows: ne * rows, data: Cow::Borrowed(&data) };
+                let t = Tensor { rows, data: Cow::Borrowed(&data[..ty.row_bytes(cols as u64) * rows]), ..all };
                 // Raw bytes, as experts are uploaded (`Backend::upload` turns Q4_0 / Q5_0 into Q8_0).
-                let raw = |t: &Tensor| { let b = gpu.alloc(t.data.len()).unwrap(); gpu.htod(t.data, &b, 0).unwrap(); GpuTensor::new(t.ty, t.rows, t.cols, b) };
+                let raw = |t: &Tensor| { let b = gpu.alloc(t.data.len()).unwrap(); gpu.htod(&t.data, &b, 0).unwrap(); GpuTensor::new(t.ty, t.rows, t.cols, b) };
                 let (dt, dall) = (raw(&t), raw(&all));
                 let what = format!("{bk} {} cols {cols}", ty.name());
                 // dequant
@@ -1538,12 +1539,12 @@ fn vulkan_type_matrix() {
             note = format!("{note}{}f16 GEMM inputs truncate (Volta OpFConvert); reference matches", if note.is_empty() { "" } else { "; " });
         }
         let data = random_tensor(ty, ne * rows, cols, cols as u32 + ty as u32);
-        let all = Tensor { ty, cols, rows: ne * rows, data: &data };
-        let t = Tensor { rows, data: &data[..ty.row_bytes(cols as u64) * rows], ..all };
+        let all = Tensor { ty, cols, rows: ne * rows, data: Cow::Borrowed(&data) };
+        let t = Tensor { rows, data: Cow::Borrowed(&data[..ty.row_bytes(cols as u64) * rows]), ..all };
         // Raw bytes, as experts are uploaded.
         let raw = |t: &Tensor| {
             let b = gpu.alloc(t.data.len()).unwrap();
-            gpu.htod(t.data, &b, 0).unwrap();
+            gpu.htod(&t.data, &b, 0).unwrap();
             GpuTensor::new(t.ty, t.rows, t.cols, b)
         };
         let (dt, dall) = (raw(&t), raw(&all));
@@ -1754,7 +1755,7 @@ fn f16_weight_uploads_as_f32() {
     let (rows, cols) = (96, 512);
     let w: Vec<f32> = xs(rows * cols).iter().map(|v| v * 3.0).collect();
     let data: Vec<u8> = w.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
-    let t = Tensor { ty: GgmlType::F16, rows, cols, data: &data };
+    let t = Tensor { ty: GgmlType::F16, rows, cols, data: Cow::Borrowed(&data) };
     let wf: Vec<f32> = w.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect();
     let nt = 40;
     let x = xs(nt * cols);

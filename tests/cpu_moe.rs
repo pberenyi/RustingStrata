@@ -33,7 +33,8 @@ fn kernel_throughput() {
     if m.cfg.n_expert == 0 { return eprintln!("SKIP: dense model"); }
     let last = format!("blk.{}.ffn_down_exps.weight", m.cfg.n_layer - 1);
     for name in ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_down_exps.weight", &last] {
-        let t = m.w.get(name).unwrap().expert(5, m.cfg.n_expert);
+        let weights = m.w.get(name).unwrap();
+        let t = weights.expert(5, m.cfg.n_expert);
         let x: Vec<f32> = (0..t.cols).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
         let mut y = vec![0f32; t.rows];
         let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();

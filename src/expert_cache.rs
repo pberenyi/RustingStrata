@@ -70,9 +70,9 @@ impl ExpertCache {
             let mut off = 0;
             let mut mats = [Mat { ty: GgmlType::F32, rows: 0, cols: 0, off: 0, bytes: 0 }; 3];
             for (i, name) in MATS.iter().enumerate() {
-                let t = m.w.layer(il, name)?.expert(0, n);
-                mats[i] = Mat { ty: t.ty, rows: t.rows, cols: t.cols, off, bytes: t.data.len() };
-                off = (off + t.data.len()).next_multiple_of(16);  // GEMV kernels read 8-byte words
+                let (ty, rows, cols, bytes) = m.w.expert_shape(il, name)?;
+                mats[i] = Mat { ty, rows, cols, off, bytes };
+                off = (off + bytes).next_multiple_of(16);  // GEMV kernels read 8-byte words
             }
             *classes.entry(off).or_default() += n;
             layers.push(Some((off, mats)));
@@ -126,8 +126,13 @@ impl ExpertCache {
         let order: Vec<usize> = order.into_iter().filter(|&i| { let r = &mut room[cache.layers[i / n].as_ref().unwrap().pool]; *r > 0 && { *r -= 1; true } }).collect();
         let pre = crate::weights::Prefetch::start();
         let mut rs = Vec::new();
-        for &i in &order {
-            for name in MATS { let t = m.w.layer(i / n, name)?.expert(i % n, n); rs.push((t.data.as_ptr() as usize, t.data.len())); }
+        if m.w.g.uses_mmap() {
+            for &i in &order {
+                for name in MATS {
+                    let t = m.w.expert(i / n, name, i % n)?;
+                    rs.push((t.data.as_ptr() as usize, t.data.len()));
+                }
+            }
         }
         pre.send(rs);
         for i in order {
@@ -145,11 +150,11 @@ impl ExpertCache {
         let lx = self.layers[il].as_mut().unwrap();
         let pool = &mut self.pools[lx.pool];
         for (name, mat) in MATS.iter().zip(&lx.mats) {
-            let t = m.w.layer(il, name)?.expert(e, self.n_expert);
+            let t = m.w.expert(il, name, e)?;
             let o = slot * pool.slot_bytes + mat.off;
             debug_assert_eq!(t.data.len(), mat.bytes);
-            gpu.htod(t.data, &pool.buf, o)?;
-            crate::weights::cold(t.data);
+            gpu.htod(t.data.as_ref(), &pool.buf, o)?;
+            crate::weights::cold(t.data.as_ref());
         }
         lx.table[e] = slot as i32;
         if sync { self.sync_table(gpu, il)?; }
