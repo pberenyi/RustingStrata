@@ -156,7 +156,7 @@ These options are accepted by `score`, `chat`, `serve`, `bench`, `perplexity`, a
 | Option | Default | Description |
 |---|---|---|
 | `--gpu` | Off | Run on a GPU; experts that do not fit in VRAM run on the CPU. Without it, use the CPU reference. |
-| `--no-mmap` | Off | Read GGUF tensors on demand instead of retaining file mappings; lowers working-set memory. With `--gpu`, CPU-routed decode experts and GPU-prefill staging experts are cached in a shared RAM budget (reserving 5% of physical RAM), with a fair share per layer and unused shares borrowable. |
+| `--no-mmap` | Off | Read GGUF tensors on demand instead of retaining file mappings; lowers working-set memory. With `--gpu`, CPU-routed decode experts and GPU-prefill staging experts share a RAM cache that rechecks available physical memory and commit headroom as it fills, reserving 5% of each. |
 | `--ctx N` | `4096` | GPU context length / KV-cache size, in tokens. |
 | `--chunk N` | Calibrated, else `4096` | GPU prefill chunk size in tokens; `0` processes tokens one at a time. |
 | `--vram-margin MB` | `512` | VRAM to leave free after placing expert layers. |

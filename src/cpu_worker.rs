@@ -6,7 +6,7 @@
 
 use crate::model::Model;
 use crate::backend::{Backend, Buf};
-use crate::weights::{ExpertCacheReservation, Tensor, available_ram, expert_cache_ram_capacity};
+use crate::weights::{ExpertCacheReservation, Tensor, available_ram, expert_cache_ram_capacity, expert_cache_ram_state};
 use anyhow::Context;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -38,8 +38,9 @@ pub struct CpuExpertCache {
     used: usize,
     budget: usize,
     layer_quota: usize,
+    layer_count: usize,
     layer_used: HashMap<usize, usize>,
-    reported_bucket: Option<usize>,
+    reported_bucket: Option<(usize, usize)>,
 }
 
 impl CpuExpertCache {
@@ -52,21 +53,29 @@ impl CpuExpertCache {
             eprintln!("CPU expert RAM cache: physical-memory availability is unknown; reading uncached experts from disk");
             return CpuExpertCache::default();
         };
-        let available = available_ram().map_or(0, |(_, available)| available);
+        let status = available_ram();
+        let available = status.map_or(0, |status| status.available);
+        let commit_available = status.and_then(|status| status.commit_available);
         let layer_count = moe_layers.iter().copied().collect::<HashSet<_>>().len();
         let layer_quota = if layer_count == 0 { 0 } else { budget / layer_count };
         eprintln!(
-            "CPU expert RAM cache: LRU enabled for CPU-routed decode misses, capacity {:.0} MB across {} MoE layers ({:.0} MB fair share per layer; unused share is borrowable; {:.0} MB available, reserving 5% of physical RAM; GPU prefill uses separate staging)",
-            budget as f64 / 1048576.0,
+            "CPU expert RAM cache [{} layers]: LRU enabled for CPU-routed decode misses, initial capacity {:.0} MB ({:.0} MB fair share per layer; unused share is borrowable; {:.0} MB physical, {:.0} MB commit available; reserving 5%; GPU prefill uses separate staging)",
             layer_count,
+            budget as f64 / 1048576.0,
             layer_quota as f64 / 1048576.0,
             available as f64 / 1048576.0,
+            commit_available.unwrap_or(0) as f64 / 1048576.0,
         );
-        CpuExpertCache { budget, layer_quota, ..CpuExpertCache::default() }
+        CpuExpertCache { budget, layer_quota, layer_count, ..CpuExpertCache::default() }
     }
 
     fn prepare(&mut self, m: &Model, il: usize, experts: &[usize]) -> anyhow::Result<()> {
         let active: HashSet<_> = experts.iter().map(|&e| (il, e)).collect();
+        let mut state = self.refresh_budget();
+        while !state.is_some_and(|(budget, used)| used <= budget) && !self.lru.is_empty() {
+            self.evict_at(0);
+            state = self.refresh_budget();
+        }
         let mut unique = HashSet::new();
         for &e in experts {
             if !unique.insert(e) { continue; }
@@ -84,7 +93,12 @@ impl CpuExpertCache {
             }
             if size > self.budget { continue; }
             if !self.make_room(size, il, &active) { continue; }
-            let Some(reservation) = ExpertCacheReservation::new(size) else { continue };
+            let reservation = loop {
+                if let Some(reservation) = ExpertCacheReservation::new(size) { break Some(reservation); }
+                let Some(i) = self.lru.iter().position(|key| !active.contains(key)) else { break None };
+                self.evict_at(i);
+            };
+            let Some(reservation) = reservation else { continue };
 
             let mats = (|| -> anyhow::Result<[Box<[u8]>; 3]> {
                 let mut mats = Vec::with_capacity(crate::expert_cache::MATS.len());
@@ -102,10 +116,11 @@ impl CpuExpertCache {
             self.used += size;
             *self.layer_used.entry(il).or_default() += size;
         }
-        let bucket = self.used / (128 << 20);
+        let bucket = (self.used / (128 << 20), self.budget / (128 << 20));
         if self.used > 0 && self.reported_bucket != Some(bucket) {
             eprintln!(
-                "CPU expert RAM cache: {:.0} MB in use / {:.0} MB capacity ({} experts cached)",
+                "CPU expert RAM cache [{} layers]: {:.0} MB in use / {:.0} MB current capacity ({} experts cached)",
+                self.layer_count,
                 self.used as f64 / 1048576.0,
                 self.budget as f64 / 1048576.0,
                 self.entries.len(),
@@ -113,6 +128,18 @@ impl CpuExpertCache {
             self.reported_bucket = Some(bucket);
         }
         Ok(())
+    }
+
+    fn refresh_budget(&mut self) -> Option<(usize, usize)> {
+        if let Some((budget, used)) = expert_cache_ram_state() {
+            self.budget = budget;
+            self.layer_quota = if self.layer_count == 0 { 0 } else { budget / self.layer_count };
+            Some((budget, used))
+        } else {
+            self.budget = 0;
+            self.layer_quota = 0;
+            None
+        }
     }
 
     fn layer_limit(&self, layer: usize) -> usize {

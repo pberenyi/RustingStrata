@@ -6,7 +6,7 @@ use super::{Ffn, GpuModel, HcAt, Mixer};
 use crate::backend::{Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
-use crate::weights::{ExpertCacheReservation, Prefetch, expert_cache_ram_capacity};
+use crate::weights::{ExpertCacheReservation, Prefetch, expert_cache_ram_capacity, expert_cache_ram_state};
 use anyhow::Context;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -14,17 +14,18 @@ use std::sync::{Arc, Mutex};
 /// Experts staged per group when a layer routes to experts outside the cache. Staging holds three groups.
 const STAGE: usize = 16;
 
-struct CachedExpert { mats: [Arc<[u8]>; 3], bytes: usize, _reservation: Option<ExpertCacheReservation> }
+struct CachedExpert { mats: [Arc<[u8]>; 3], bytes: usize, _reservation: Option<Arc<ExpertCacheReservation>> }
 
 #[derive(Default)]
 struct PrefillExpertCache {
-    entries: HashMap<(usize, usize), CachedExpert>,
+    entries: HashMap<(usize, usize), Arc<CachedExpert>>,
     lru: VecDeque<(usize, usize)>,
     layer_used: HashMap<usize, usize>,
     used: usize,
     budget: usize,
     layer_quota: usize,
-    reported_bucket: Option<usize>,
+    layer_count: usize,
+    reported_bucket: Option<(usize, usize)>,
 }
 
 impl PrefillExpertCache {
@@ -34,24 +35,29 @@ impl PrefillExpertCache {
             eprintln!("GPU prefill expert RAM cache: physical-memory availability is unknown; prefill reads uncached experts from disk");
             return PrefillExpertCache::default();
         };
-        let layers = m.cfg.n_layer;
-        let layer_quota = if layers == 0 { 0 } else { budget / layers };
+        let layer_count = m.cfg.n_layer;
+        let layer_quota = if layer_count == 0 { 0 } else { budget / layer_count };
         eprintln!(
-            "GPU prefill expert RAM cache: LRU enabled, capacity {:.0} MB across {} layers ({:.0} MB fair share per layer; unused share is borrowable)",
+            "GPU prefill expert RAM cache [{} layers]: LRU enabled, initial capacity {:.0} MB ({:.0} MB fair share per layer; unused share is borrowable)",
+            layer_count,
             budget as f64 / 1048576.0,
-            layers,
             layer_quota as f64 / 1048576.0,
         );
-        PrefillExpertCache { budget, layer_quota, ..PrefillExpertCache::default() }
+        PrefillExpertCache { budget, layer_quota, layer_count, ..PrefillExpertCache::default() }
     }
 
-    fn expert(&mut self, m: &Model, il: usize, e: usize) -> anyhow::Result<Option<[Arc<[u8]>; 3]>> {
+    fn expert(&mut self, m: &Model, il: usize, e: usize) -> anyhow::Result<Option<Arc<CachedExpert>>> {
+        let mut state = self.refresh_budget();
+        while !state.is_some_and(|(budget, used)| used <= budget) && !self.lru.is_empty() {
+            self.evict_at(0);
+            state = self.refresh_budget();
+        }
         let key = (il, e);
         if let Some(cached) = self.entries.get(&key) {
-            let mats = cached.mats.clone();
+            let cached = cached.clone();
             self.lru.retain(|&item| item != key);
             self.lru.push_back(key);
-            return Ok(Some(mats));
+            return Ok(Some(cached));
         }
 
         let size = MATS.iter().try_fold(0usize, |size, name| {
@@ -61,7 +67,12 @@ impl PrefillExpertCache {
         if size > self.budget || !self.make_room(size, il) {
             return Ok(None);
         }
-        let Some(reservation) = ExpertCacheReservation::new(size) else { return Ok(None) };
+        let reservation = loop {
+            if let Some(reservation) = ExpertCacheReservation::new(size) { break Some(reservation); }
+            if self.lru.is_empty() { break None; }
+            self.evict_at(0);
+        };
+        let Some(reservation) = reservation else { return Ok(None) };
 
         let loaded = (|| -> anyhow::Result<[Arc<[u8]>; 3]> {
             let mut mats = Vec::with_capacity(MATS.len());
@@ -74,22 +85,40 @@ impl PrefillExpertCache {
             Ok(mats) => mats,
             Err(err) => return Err(err),
         };
-        self.entries.insert(key, CachedExpert { mats: mats.clone(), bytes: size, _reservation: Some(reservation) });
+        let cached = Arc::new(CachedExpert {
+            mats,
+            bytes: size,
+            _reservation: Some(Arc::new(reservation)),
+        });
+        self.entries.insert(key, cached.clone());
         self.lru.push_back(key);
         self.used += size;
         *self.layer_used.entry(il).or_default() += size;
 
-        let bucket = self.used / (128 << 20);
+        let bucket = (self.used / (128 << 20), self.budget / (128 << 20));
         if self.reported_bucket != Some(bucket) {
             eprintln!(
-                "GPU prefill expert RAM cache: {:.0} MB in use / {:.0} MB capacity ({} experts cached)",
+                "GPU prefill expert RAM cache [{} layers]: {:.0} MB in use / {:.0} MB current capacity ({} experts cached)",
+                self.layer_count,
                 self.used as f64 / 1048576.0,
                 self.budget as f64 / 1048576.0,
                 self.entries.len(),
             );
             self.reported_bucket = Some(bucket);
         }
-        Ok(Some(mats))
+        Ok(Some(cached))
+    }
+
+    fn refresh_budget(&mut self) -> Option<(usize, usize)> {
+        let state = expert_cache_ram_state();
+        if let Some((budget, _)) = state {
+            self.budget = budget;
+            self.layer_quota = if self.layer_count == 0 { 0 } else { budget / self.layer_count };
+        } else {
+            self.budget = 0;
+            self.layer_quota = 0;
+        }
+        state
     }
 
     fn layer_limit(&self, layer: usize) -> usize {
@@ -589,8 +618,8 @@ impl GpuModel<'_> {
                                 let mi = MATS.iter().position(|&n| n == *name).unwrap();
                                 let mut i = 0;
                                 while i < run.len() {
-                                    if let Some(mats) = &cached[i] {
-                                        g.htod(mats[mi].as_ref(), &pf.staging, dst + i * mat.bytes)?;
+                                    if let Some(expert) = &cached[i] {
+                                        g.htod(expert.mats[mi].as_ref(), &pf.staging, dst + i * mat.bytes)?;
                                         i += 1;
                                     } else {
                                         let start = i;
@@ -664,7 +693,7 @@ mod tests {
     }
 
     fn insert(cache: &mut PrefillExpertCache, key: (usize, usize)) {
-        cache.entries.insert(key, cached_expert());
+        cache.entries.insert(key, Arc::new(cached_expert()));
         cache.lru.push_back(key);
         cache.used += 4;
         *cache.layer_used.entry(key.0).or_default() += 4;

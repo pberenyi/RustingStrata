@@ -377,18 +377,16 @@ pub fn system() -> Value {
     #[cfg(windows)]
     {
         #[repr(C)]
-        struct MemStatus { len: u32, load: u32, total: u64, avail: u64, rest: [u64; 5] }
-        #[repr(C)]
         struct ProcMem { cb: u32, faults: u32, peak: usize, ws: usize, rest: [usize; 6] }
         #[link(name = "kernel32")]
         unsafe extern "system" {
-            fn GlobalMemoryStatusEx(m: *mut MemStatus) -> i32;
             fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
             fn GetCurrentProcess() -> isize;
             fn K32GetProcessMemoryInfo(p: isize, m: *mut ProcMem, cb: u32) -> i32;
         }
-        let mut m = MemStatus { len: size_of::<MemStatus>() as u32, load: 0, total: 0, avail: 0, rest: [0; 5] };
-        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 { (v["ram_total"], v["ram_used"]) = (m.total.into(), (m.total - m.avail).into()); }
+        if let Some(m) = crate::weights::available_ram() {
+            (v["ram_total"], v["ram_used"]) = (m.total.into(), (m.total - m.available).into());
+        }
         let (mut i, mut k, mut u) = (0, 0, 0);
         // Kernel time includes idle time.
         if unsafe { GetSystemTimes(&mut i, &mut k, &mut u) } != 0 { v["cpu_pct"] = cpu_pct(k + u - i, k + u); }
