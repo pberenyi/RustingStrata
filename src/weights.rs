@@ -1,7 +1,7 @@
 //! Named tensor views over the mmapped GGUF, page cache advice for them, and a reference parallel matvec.
 
 use crate::config::ModelConfig;
-use crate::gguf::Gguf;
+use crate::gguf::{Gguf, MappedBytes};
 use crate::quant::{GgmlType, dequant_row};
 use anyhow::Context;
 use std::borrow::Cow;
@@ -197,6 +197,18 @@ impl<'a> Weights<'a> {
         Ok(Tensor { ty, rows, cols, data })
     }
 
+    pub fn map_expert(&self, il: usize, suffix: &str, e: usize) -> anyhow::Result<MappedBytes> {
+        self.map_expert_range(il, suffix, e, 1)
+    }
+
+    pub fn map_expert_range(&self, il: usize, suffix: &str, first: usize, count: usize) -> anyhow::Result<MappedBytes> {
+        let (_, _, _, bytes) = self.expert_shape(il, suffix)?;
+        let name = format!("blk.{il}.{suffix}");
+        anyhow::ensure!(first <= self.n_expert && count <= self.n_expert - first, "expert range out of bounds for {name}");
+        let t = self.info(&name)?;
+        self.g.map_bytes_range(t, first * bytes, count * bytes)
+    }
+
     pub fn expert_range(&self, il: usize, suffix: &str, first: usize, count: usize) -> anyhow::Result<Cow<'_, [u8]>> {
         let (_, _, _, bytes) = self.expert_shape(il, suffix)?;
         let name = format!("blk.{il}.{suffix}");
@@ -277,8 +289,6 @@ mod tests {
 pub(crate) struct RamStatus {
     pub total: u64,
     pub available: u64,
-    pub commit_limit: Option<u64>,
-    pub commit_available: Option<u64>,
 }
 
 #[cfg(target_os = "linux")]
@@ -291,13 +301,9 @@ pub(crate) fn available_ram() -> Option<RamStatus> {
         })
     };
     let total = bytes("MemTotal:")?;
-    let commit_limit = bytes("CommitLimit:");
-    let committed = bytes("Committed_AS:");
     Some(RamStatus {
         total,
         available: bytes("MemAvailable:")?,
-        commit_limit,
-        commit_available: commit_limit.zip(committed).map(|(limit, used)| limit.saturating_sub(used)),
     })
 }
 
@@ -309,8 +315,8 @@ pub(crate) fn available_ram() -> Option<RamStatus> {
         load: u32,
         total: u64,
         avail: u64,
-        pagefile_total: u64,
-        pagefile_available: u64,
+        _pagefile_total: u64,
+        _pagefile_available: u64,
         rest: [u64; 3],
     }
     #[link(name = "kernel32")]
@@ -322,15 +328,20 @@ pub(crate) fn available_ram() -> Option<RamStatus> {
         load: 0,
         total: 0,
         avail: 0,
-        pagefile_total: 0,
-        pagefile_available: 0,
+        _pagefile_total: 0,
+        _pagefile_available: 0,
         rest: [0; 3],
     };
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(RamStatus {
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0
+        || m.total == 0
+        || m.total > isize::MAX as u64
+        || m.avail > m.total
+    {
+        return None;
+    }
+    Some(RamStatus {
         total: m.total,
         available: m.avail,
-        commit_limit: Some(m.pagefile_total),
-        commit_available: Some(m.pagefile_available),
     })
 }
 
@@ -338,16 +349,13 @@ pub(crate) fn available_ram() -> Option<RamStatus> {
 pub(crate) fn available_ram() -> Option<RamStatus> { None }
 
 struct ExpertCacheRam {
-    physical_reserve: usize,
+    capacity: usize,
     used: AtomicUsize,
 }
 
-fn cache_admission_limit(status: RamStatus, physical_reserve: usize, used: usize) -> u64 {
-    let physical = status.available.saturating_add(used as u64).saturating_sub(physical_reserve as u64);
-    let commit_reserve = status.commit_limit.map(|limit| limit / 20);
-    let commit = status.commit_available.zip(commit_reserve)
-        .map_or(u64::MAX, |(available, reserve)| available.saturating_add(used as u64).saturating_sub(reserve as u64));
-    physical.min(commit)
+fn expert_cache_capacity(status: RamStatus) -> Option<usize> {
+    let physical_reserve = usize::try_from(status.total / 20).ok()?;
+    usize::try_from(status.available.saturating_sub(physical_reserve as u64)).ok()
 }
 
 static EXPERT_CACHE_RAM: OnceLock<Option<ExpertCacheRam>> = OnceLock::new();
@@ -355,21 +363,19 @@ static EXPERT_CACHE_RAM: OnceLock<Option<ExpertCacheRam>> = OnceLock::new();
 fn expert_cache_ram() -> Option<&'static ExpertCacheRam> {
     EXPERT_CACHE_RAM.get_or_init(|| {
         let status = available_ram()?;
-        let physical_reserve = usize::try_from(status.total / 20).ok()?;
-        Some(ExpertCacheRam { physical_reserve, used: AtomicUsize::new(0) })
+        let capacity = expert_cache_capacity(status)?;
+        Some(ExpertCacheRam { capacity, used: AtomicUsize::new(0) })
     }).as_ref()
 }
 
 pub(crate) fn expert_cache_ram_capacity() -> Option<usize> {
-    expert_cache_ram_state().map(|(capacity, _)| capacity)
+    expert_cache_ram().map(|state| state.capacity)
 }
 
 pub(crate) fn expert_cache_ram_state() -> Option<(usize, usize)> {
     let state = expert_cache_ram()?;
     let used = state.used.load(Ordering::Acquire);
-    let status = available_ram()?;
-    let capacity = usize::try_from(cache_admission_limit(status, state.physical_reserve, used)).ok()?;
-    Some((capacity, used))
+    Some((state.capacity, used))
 }
 
 fn reserve_expert_cache_ram(bytes: usize) -> bool {
@@ -377,8 +383,7 @@ fn reserve_expert_cache_ram(bytes: usize) -> bool {
     let mut current = state.used.load(Ordering::Relaxed);
     loop {
         let Some(next) = current.checked_add(bytes) else { return false };
-        let Some(status) = available_ram() else { return false };
-        if next as u64 > cache_admission_limit(status, state.physical_reserve, current) {
+        if next > state.capacity {
             return false;
         }
         match state.used.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
@@ -395,6 +400,7 @@ fn release_expert_cache_ram(bytes: usize) {
     }
 }
 
+/// Tracks file-backed expert bytes against the physical-RAM cache budget; it does not reserve system commit.
 pub(crate) struct ExpertCacheReservation(usize);
 
 impl ExpertCacheReservation {
@@ -412,43 +418,30 @@ mod memory_budget_tests {
     use super::*;
 
     #[test]
-    fn expert_cache_budget_obeys_commit_and_physical_limits() {
+    fn expert_cache_budget_uses_startup_available_physical_ram_and_reserve() {
         let status = RamStatus {
             total: 32_000,
             available: 20_000,
-            commit_limit: Some(48_000),
-            commit_available: Some(3_000),
         };
-        assert_eq!(cache_admission_limit(status, 1_600, 0), 600);
+        assert_eq!(expert_cache_capacity(status), Some(18_400));
     }
 
     #[test]
-    fn expert_cache_admission_rechecks_commit_headroom_after_external_allocations() {
+    fn expert_cache_budget_is_zero_below_physical_reserve() {
         let status = RamStatus {
             total: 32_000,
-            available: 19_000,
-            commit_limit: Some(48_000),
-            commit_available: Some(1_000),
+            available: 1_000,
         };
-        assert_eq!(cache_admission_limit(status, 1_600, 1_000), 0);
+        assert_eq!(expert_cache_capacity(status), Some(0));
     }
 
     #[test]
-    fn expert_cache_limit_can_grow_when_commit_headroom_returns() {
-        let initially = RamStatus {
+    fn expert_cache_budget_does_not_exceed_available_physical_ram() {
+        let status = RamStatus {
             total: 32_000,
-            available: 11_000,
-            commit_limit: Some(48_000),
-            commit_available: Some(3_000),
+            available: 20_000,
         };
-        let later = RamStatus {
-            available: 17_000,
-            commit_available: Some(8_000),
-            ..initially
-        };
-        let physical_reserve = 1_600;
-        assert_eq!(cache_admission_limit(initially, physical_reserve, 1_000), 1_600);
-        assert_eq!(cache_admission_limit(later, physical_reserve, 1_000), 6_600);
+        assert!(expert_cache_capacity(status).unwrap() <= status.available as usize);
     }
 }
 

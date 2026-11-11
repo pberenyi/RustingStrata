@@ -1353,7 +1353,10 @@ impl<'a> GpuModel<'a> {
             self.cpu_time = w.busy();
             // No swap can be beneficial with no miss: `adapt` would only scan all 10240 entries (R2).
             if !fast && self.adapt_every > 0 && (count - nt) / self.adapt_every < count / self.adapt_every {
-                cache.adapt(self.m, &*self.gpu, 64)?;
+                // Demoted experts become hot CPU misses: warm the no-mmap RAM cache for them before the next
+                // token routes there (mmap: the RAM cache is disabled, so `promote` is a no-op).
+                let demoted = cache.adapt(self.m, &*self.gpu, 64)?;
+                if !demoted.is_empty() { w.promote(&demoted); }
             }
         }
         Ok(())

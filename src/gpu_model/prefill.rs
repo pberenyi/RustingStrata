@@ -5,16 +5,91 @@
 use super::{Ffn, GpuModel, HcAt, Mixer};
 use crate::backend::{Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
+use crate::gguf::MappedBytes;
 use crate::model::Model;
 use crate::weights::{ExpertCacheReservation, Prefetch, expert_cache_ram_capacity, expert_cache_ram_state};
 use anyhow::Context;
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Experts staged per group when a layer routes to experts outside the cache. Staging holds three groups.
 const STAGE: usize = 16;
 
-struct CachedExpert { mats: [Arc<[u8]>; 3], bytes: usize, _reservation: Option<Arc<ExpertCacheReservation>> }
+fn expert_run_offsets(grp: &[(usize, [u64; 3])]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for i in 1..=grp.len() {
+        if i == grp.len() || grp[i].0 != grp[i - 1].0 + 1 {
+            runs.push((start, i - start));
+            start = i;
+        }
+    }
+    runs
+}
+
+struct CachedExpert { mats: [MappedBytes; 3], bytes: usize, _reservation: Option<Arc<ExpertCacheReservation>> }
+
+#[derive(Clone, Copy, Default)]
+struct PrefillCacheCounters {
+    hits: u64,
+    misses: u64,
+    insertions: u64,
+    evictions: u64,
+    cached_bytes_loaded: u64,
+    uncached_bytes_read: u64,
+    capacity_changes: u64,
+}
+
+#[derive(Clone)]
+struct PrefillCacheSnapshot {
+    counters: PrefillCacheCounters,
+    capacity: usize,
+    min_capacity: usize,
+    max_capacity: usize,
+    used: usize,
+    experts: usize,
+    layer_count: usize,
+    layer_counters: HashMap<usize, PrefillLayerCounters>,
+    layer_used: HashMap<usize, usize>,
+    layer_experts: HashMap<usize, usize>,
+    layer_expert_bytes: HashMap<usize, usize>,
+    layer_quota: HashMap<usize, usize>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PrefillLayerCounters {
+    hits: u64,
+    misses: u64,
+    insertions: u64,
+    evictions: u64,
+}
+
+fn proportional_layer_quotas(budget: usize, bank_bytes: &HashMap<usize, usize>, total: usize) -> HashMap<usize, usize> {
+    if total == 0 { return bank_bytes.keys().map(|&layer| (layer, 0)).collect(); }
+    bank_bytes.iter()
+        .map(|(&layer, &bytes)| (layer, ((budget as u128 * bytes as u128) / total as u128) as usize))
+        .collect()
+}
+
+struct PrefillProfile {
+    started: Instant,
+    cache_lookup: Cell<Duration>,
+    expert_range: Cell<Duration>,
+    host_upload: Cell<Duration>,
+}
+
+impl PrefillProfile {
+    fn new() -> PrefillProfile {
+        PrefillProfile {
+            started: Instant::now(),
+            cache_lookup: Cell::new(Duration::ZERO),
+            expert_range: Cell::new(Duration::ZERO),
+            host_upload: Cell::new(Duration::ZERO),
+        }
+    }
+}
 
 #[derive(Default)]
 struct PrefillExpertCache {
@@ -23,27 +98,56 @@ struct PrefillExpertCache {
     layer_used: HashMap<usize, usize>,
     used: usize,
     budget: usize,
-    layer_quota: usize,
+    layer_quota: HashMap<usize, usize>,
     layer_count: usize,
     reported_bucket: Option<(usize, usize)>,
+    counters: PrefillCacheCounters,
+    layer_counters: HashMap<usize, PrefillLayerCounters>,
+    layer_expert_bytes: HashMap<usize, usize>,
+    layer_bank_bytes: HashMap<usize, usize>,
+    total_expert_bank_bytes: usize,
+    min_capacity: usize,
+    max_capacity: usize,
 }
 
 impl PrefillExpertCache {
-    fn new(m: &Model) -> PrefillExpertCache {
-        if m.w.g.uses_mmap() || !m.cfg.is_moe() { return PrefillExpertCache::default(); }
+    fn new(m: &Model) -> anyhow::Result<PrefillExpertCache> {
+        if m.w.g.uses_mmap() || !m.cfg.is_moe() { return Ok(PrefillExpertCache::default()); }
         let Some(budget) = expert_cache_ram_capacity() else {
             eprintln!("GPU prefill expert RAM cache: physical-memory availability is unknown; prefill reads uncached experts from disk");
-            return PrefillExpertCache::default();
+            return Ok(PrefillExpertCache::default());
         };
         let layer_count = m.cfg.n_layer;
-        let layer_quota = if layer_count == 0 { 0 } else { budget / layer_count };
+        let mut layer_expert_bytes = HashMap::with_capacity(layer_count);
+        let mut layer_bank_bytes = HashMap::with_capacity(layer_count);
+        let mut total_bank_bytes = 0usize;
+        for il in 0..layer_count {
+            let expert_bytes = MATS.iter().try_fold(0usize, |size, name| {
+                size.checked_add(m.w.expert_shape(il, name)?.3)
+                    .context("GPU prefill expert size overflow")
+            })?;
+            layer_expert_bytes.insert(il, expert_bytes);
+            let bank_bytes = expert_bytes.checked_mul(m.cfg.n_expert)
+                .context("GPU prefill expert bank size overflow")?;
+            total_bank_bytes = total_bank_bytes.checked_add(bank_bytes)
+                .context("GPU prefill expert bank total overflow")?;
+            layer_bank_bytes.insert(il, bank_bytes);
+        }
+        let layer_quota = proportional_layer_quotas(budget, &layer_bank_bytes, total_bank_bytes);
         eprintln!(
-            "GPU prefill expert RAM cache [{} layers]: LRU enabled, initial capacity {:.0} MB ({:.0} MB fair share per layer; unused share is borrowable)",
+            "GPU prefill expert RAM cache [{} layers]: file-backed LRU enabled, initial physical-RAM budget {:.0} MB (layer shares proportional to expert-bank bytes; unused share is borrowable; commit is not reserved)",
             layer_count,
             budget as f64 / 1048576.0,
-            layer_quota as f64 / 1048576.0,
         );
-        PrefillExpertCache { budget, layer_quota, layer_count, ..PrefillExpertCache::default() }
+        Ok(PrefillExpertCache {
+            budget,
+            layer_quota,
+            layer_count,
+            layer_expert_bytes,
+            layer_bank_bytes,
+            total_expert_bank_bytes: total_bank_bytes,
+            ..PrefillExpertCache::default()
+        })
     }
 
     fn expert(&mut self, m: &Model, il: usize, e: usize) -> anyhow::Result<Option<Arc<CachedExpert>>> {
@@ -54,11 +158,15 @@ impl PrefillExpertCache {
         }
         let key = (il, e);
         if let Some(cached) = self.entries.get(&key) {
+            self.counters.hits += 1;
+            self.layer_counters.entry(il).or_default().hits += 1;
             let cached = cached.clone();
             self.lru.retain(|&item| item != key);
             self.lru.push_back(key);
             return Ok(Some(cached));
         }
+        self.counters.misses += 1;
+        self.layer_counters.entry(il).or_default().misses += 1;
 
         let size = MATS.iter().try_fold(0usize, |size, name| {
             size.checked_add(m.w.expert_shape(il, name)?.3)
@@ -74,10 +182,10 @@ impl PrefillExpertCache {
         };
         let Some(reservation) = reservation else { return Ok(None) };
 
-        let loaded = (|| -> anyhow::Result<[Arc<[u8]>; 3]> {
+        let loaded = (|| -> anyhow::Result<[MappedBytes; 3]> {
             let mut mats = Vec::with_capacity(MATS.len());
             for name in MATS {
-                mats.push(Arc::<[u8]>::from(m.w.expert(il, name, e)?.data.into_owned()));
+                mats.push(m.w.map_expert(il, name, e)?);
             }
             mats.try_into().map_err(|_| anyhow::anyhow!("expected three GPU prefill expert matrices"))
         })();
@@ -94,6 +202,9 @@ impl PrefillExpertCache {
         self.lru.push_back(key);
         self.used += size;
         *self.layer_used.entry(il).or_default() += size;
+        self.counters.insertions += 1;
+        self.counters.cached_bytes_loaded += size as u64;
+        self.layer_counters.entry(il).or_default().insertions += 1;
 
         let bucket = (self.used / (128 << 20), self.budget / (128 << 20));
         if self.reported_bucket != Some(bucket) {
@@ -111,36 +222,75 @@ impl PrefillExpertCache {
 
     fn refresh_budget(&mut self) -> Option<(usize, usize)> {
         let state = expert_cache_ram_state();
+        let previous_budget = self.budget;
         if let Some((budget, _)) = state {
             self.budget = budget;
-            self.layer_quota = if self.layer_count == 0 { 0 } else { budget / self.layer_count };
+            self.layer_quota = proportional_layer_quotas(budget, &self.layer_bank_bytes, self.total_expert_bank_bytes);
         } else {
             self.budget = 0;
-            self.layer_quota = 0;
+            self.layer_quota = proportional_layer_quotas(0, &self.layer_bank_bytes, self.total_expert_bank_bytes);
         }
+        if self.budget != previous_budget {
+            self.counters.capacity_changes += 1;
+        }
+        self.min_capacity = self.min_capacity.min(self.budget);
+        self.max_capacity = self.max_capacity.max(self.budget);
         state
+    }
+
+    fn begin_chunk(&mut self) -> PrefillCacheSnapshot {
+        self.min_capacity = self.budget;
+        self.max_capacity = self.budget;
+        self.snapshot()
+    }
+
+    fn snapshot(&self) -> PrefillCacheSnapshot {
+        let mut layer_experts: HashMap<usize, usize> = HashMap::new();
+        for &(layer, _) in self.entries.keys() {
+            *layer_experts.entry(layer).or_default() += 1;
+        }
+        PrefillCacheSnapshot {
+            counters: self.counters,
+            capacity: self.budget,
+            min_capacity: self.min_capacity,
+            max_capacity: self.max_capacity,
+            used: self.used,
+            experts: self.entries.len(),
+            layer_count: self.layer_count,
+            layer_counters: self.layer_counters.clone(),
+            layer_used: self.layer_used.clone(),
+            layer_experts,
+            layer_expert_bytes: self.layer_expert_bytes.clone(),
+            layer_quota: self.layer_quota.clone(),
+        }
+    }
+
+    fn record_uncached_bytes(&mut self, bytes: usize) {
+        self.counters.uncached_bytes_read += bytes as u64;
     }
 
     fn layer_limit(&self, layer: usize) -> usize {
         let borrowed = self.layer_used.iter()
             .filter(|(other, _)| **other != layer)
-            .fold(0usize, |sum, (_, &used)| sum.saturating_add(used.min(self.layer_quota)));
+            .fold(0usize, |sum, (other, &used)| {
+                sum.saturating_add(used.min(self.layer_quota.get(other).copied().unwrap_or(0)))
+            });
         self.budget.saturating_sub(borrowed)
     }
 
     fn make_room(&mut self, size: usize, layer: usize) -> bool {
+        let layer_used = self.layer_used.get(&layer).copied().unwrap_or(0);
+        if layer_used.checked_add(size).is_none_or(|next| next > self.layer_limit(layer)) {
+            return false;
+        }
         loop {
-            let layer_used = self.layer_used.get(&layer).copied().unwrap_or(0);
-            if layer_used.checked_add(size).is_none_or(|next| next > self.layer_limit(layer)) {
-                let Some(i) = self.lru.iter().position(|key| key.0 == layer) else { return false };
-                self.evict_at(i);
-                continue;
-            }
             if self.used.checked_add(size).is_some_and(|next| next <= self.budget) { return true; }
             let over_quota = self.lru.iter().position(|key| {
-                self.layer_used.get(&key.0).copied().unwrap_or(0) > self.layer_quota
+                key.0 != layer
+                    && self.layer_used.get(&key.0).copied().unwrap_or(0)
+                    > self.layer_quota.get(&key.0).copied().unwrap_or(0)
             });
-            let Some(i) = over_quota.or_else(|| (!self.lru.is_empty()).then_some(0)) else { return false };
+            let Some(i) = over_quota else { return false };
             self.evict_at(i);
         }
     }
@@ -149,6 +299,8 @@ impl PrefillExpertCache {
         let key = self.lru.remove(index).unwrap();
         if let Some(old) = self.entries.remove(&key) {
             self.used -= old.bytes;
+            self.counters.evictions += 1;
+            self.layer_counters.entry(key.0).or_default().evictions += 1;
             let layer_bytes = self.layer_used.get_mut(&key.0).unwrap();
             *layer_bytes -= old.bytes;
             if *layer_bytes == 0 { self.layer_used.remove(&key.0); }
@@ -211,7 +363,7 @@ impl Scratch {
             chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
             slab: gpu.zeros::<f32>(total)?, ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
-            host_cache: Mutex::new(PrefillExpertCache::new(m)),
+            host_cache: Mutex::new(PrefillExpertCache::new(m)?),
         })
     }
 
@@ -240,7 +392,12 @@ impl GpuModel<'_> {
         let mut p = Some(&mut *self);
         while let Some(q) = p {
             if let Some(cache) = q.cache.as_mut() {
-                if adapt && !cache.fully_resident() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+                if adapt && !cache.fully_resident() {
+                    // Demoted experts become hot CPU misses: warm the no-mmap RAM cache for them before decode
+                    // routes there (mmap: the RAM cache is disabled, so `promote` is a no-op).
+                    let demoted = cache.adapt(q.m, &*q.gpu, usize::MAX)?;
+                    if !demoted.is_empty() { if let Some(w) = q.worker.as_ref() { w.promote(&demoted); } }
+                }
             }
             p = q.next.as_deref_mut();
         }
@@ -341,6 +498,12 @@ impl GpuModel<'_> {
         };
         let c = &self.m.cfg;
         let pf = self.pf.as_ref().unwrap();
+        let profiling = std::env::var_os("STRATA_PREFILL_PROFILE").is_some();
+        if profiling { self.gpu.sync()?; }
+        let profile = profiling.then(PrefillProfile::new);
+        let cache_before = pf.host_cache.lock()
+            .map_err(|_| anyhow::anyhow!("GPU prefill expert RAM cache lock poisoned"))?
+            .begin_chunk();
         let (g, mut t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
         let d = c.hc_n.max(1) * ne;
         g.put(emb, &pf.slab, 0)?;
@@ -525,18 +688,16 @@ impl GpuModel<'_> {
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
                     if let Some(pre) = &pre {
-                        if self.m.w.g.uses_mmap() {
-                            let mut ranges = Vec::new();
-                            for grp in missed.chunks(STAGE) {
-                                for name in MATS {
-                                    for run in grp.chunk_by(|a, b| *b == a + 1) {
-                                        let data = self.m.w.expert_range(il, name, run[0], run.len())?;
-                                        ranges.push((data.as_ptr() as usize, data.len()));
-                                    }
+                        let mut ranges = Vec::new();
+                        for grp in missed.chunks(STAGE) {
+                            for name in MATS {
+                                for run in grp.chunk_by(|a, b| *b == a + 1) {
+                                    let data = self.m.w.map_expert_range(il, name, run[0], run.len())?;
+                                    ranges.push((data.as_ptr() as usize, data.len()));
                                 }
                             }
-                            pre.send(ranges);
                         }
+                        pre.send(ranges);
                     }
                     // Staged groups of at most STAGE missed experts, group j in staging third j % 3. Staging holds
                     // each matrix in its own section (all gates, then ups, then downs), so experts with consecutive
@@ -601,34 +762,69 @@ impl GpuModel<'_> {
                     let [mg, mu, md] = lx.mats;
                     let copy = |j: usize| -> anyhow::Result<()> {
                         let grp = &staged[j];
+                        let cached = if self.m.w.g.uses_mmap() {
+                            Vec::new()
+                        } else {
+                            let lookup_started = profile.as_ref().map(|_| Instant::now());
+                            let mut host_cache = pf.host_cache.lock()
+                                .map_err(|_| anyhow::anyhow!("GPU prefill expert RAM cache lock poisoned"))?;
+                            let cached = grp.iter().map(|&(e, _)| host_cache.expert(self.m, il, e))
+                                .collect::<anyhow::Result<Vec<_>>>()?;
+                            if let (Some(profile), Some(started)) = (&profile, lookup_started) {
+                                profile.cache_lookup.set(profile.cache_lookup.get() + started.elapsed());
+                            }
+                            cached
+                        };
+                        let upload = |data: &[u8], dst: usize| -> anyhow::Result<()> {
+                            if let Some(profile) = &profile {
+                                let started = Instant::now();
+                                let result = g.htod(data, &pf.staging, dst);
+                                profile.host_upload.set(profile.host_upload.get() + started.elapsed());
+                                result
+                            } else {
+                                g.htod(data, &pf.staging, dst)
+                            }
+                        };
+                        let expert_range = |name: &str, first: usize, count: usize| -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+                            if let Some(profile) = &profile {
+                                let started = Instant::now();
+                                let result = self.m.w.expert_range(il, name, first, count);
+                                profile.expert_range.set(profile.expert_range.get() + started.elapsed());
+                                result
+                            } else {
+                                self.m.w.expert_range(il, name, first, count)
+                            }
+                        };
+                        let mut uncached_bytes = 0usize;
                         for (name, mat) in MATS.iter().zip(&lx.mats) {
-                            for run in grp.chunk_by(|a, b| b.0 == a.0 + 1) {
-                                let dst = half(j) + STAGE * mat.off;
+                            for (run_start, run_len) in expert_run_offsets(grp) {
+                                let run = &grp[run_start..run_start + run_len];
+                                let dst = half(j) + STAGE * mat.off + run_start * mat.bytes;
                                 if self.m.w.g.uses_mmap() {
-                                    let data = self.m.w.expert_range(il, name, run[0].0, run.len())?;
-                                    g.htod(data.as_ref(), &pf.staging, dst)?;
+                                    let data = expert_range(name, run[0].0, run.len())?;
+                                    upload(data.as_ref(), dst)?;
                                     continue;
-                                }
-                                let mut cached = Vec::with_capacity(run.len());
-                                for &(e, _) in run {
-                                    cached.push(pf.host_cache.lock()
-                                        .map_err(|_| anyhow::anyhow!("GPU prefill expert RAM cache lock poisoned"))?
-                                        .expert(self.m, il, e)?);
                                 }
                                 let mi = MATS.iter().position(|&n| n == *name).unwrap();
                                 let mut i = 0;
                                 while i < run.len() {
-                                    if let Some(expert) = &cached[i] {
-                                        g.htod(expert.mats[mi].as_ref(), &pf.staging, dst + i * mat.bytes)?;
+                                    if let Some(expert) = &cached[run_start + i] {
+                                        upload(expert.mats[mi].as_ref(), dst + i * mat.bytes)?;
                                         i += 1;
                                     } else {
                                         let start = i;
-                                        while i < run.len() && cached[i].is_none() { i += 1; }
-                                        let data = self.m.w.expert_range(il, name, run[start].0, i - start)?;
-                                        g.htod(data.as_ref(), &pf.staging, dst + start * mat.bytes)?;
+                                        while i < run.len() && cached[run_start + i].is_none() { i += 1; }
+                                        let data = expert_range(name, run[start].0, i - start)?;
+                                        uncached_bytes += data.len();
+                                        upload(data.as_ref(), dst + start * mat.bytes)?;
                                     }
                                 }
                             }
+                        }
+                        if uncached_bytes > 0 {
+                            pf.host_cache.lock()
+                                .map_err(|_| anyhow::anyhow!("GPU prefill expert RAM cache lock poisoned"))?
+                                .record_uncached_bytes(uncached_bytes);
                         }
                         Ok(())
                     };
@@ -668,6 +864,71 @@ impl GpuModel<'_> {
             if trace { eprintln!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
             g.kick()?;
         }
+        let final_sync_wait = if profile.is_some() {
+            let started = Instant::now();
+            g.sync()?;
+            started.elapsed()
+        } else {
+            Duration::ZERO
+        };
+        if let Some(profile) = &profile {
+            eprintln!(
+                "GPU prefill profile ({} tokens): GPU-synced chunk elapsed {:.1} ms, final sync wait {:.1} ms, expert-cache lookup/map {:.1} ms, expert-range access/read {:.1} ms, host upload calls {:.1} ms",
+                toks.len(),
+                profile.started.elapsed().as_secs_f64() * 1000.0,
+                final_sync_wait.as_secs_f64() * 1000.0,
+                profile.cache_lookup.get().as_secs_f64() * 1000.0,
+                profile.expert_range.get().as_secs_f64() * 1000.0,
+                profile.host_upload.get().as_secs_f64() * 1000.0,
+            );
+        }
+        let cache_after = pf.host_cache.lock()
+            .map_err(|_| anyhow::anyhow!("GPU prefill expert RAM cache lock poisoned"))?
+            .snapshot();
+        if cache_after.capacity > 0 || cache_before.capacity > 0 {
+            let before = cache_before.counters;
+            let after = cache_after.counters;
+            eprintln!(
+                "GPU prefill cache chunk ({} tokens): hits {}, misses {}, insertions {}, evictions {}, cached GGUF {:.0} MB, uncached GGUF {:.0} MB; capacity {:.0}->{:.0} MB (range {:.0}-{:.0}, {} changes), in use {:.0} MB ({} experts)",
+                toks.len(),
+                after.hits - before.hits,
+                after.misses - before.misses,
+                after.insertions - before.insertions,
+                after.evictions - before.evictions,
+                (after.cached_bytes_loaded - before.cached_bytes_loaded) as f64 / 1048576.0,
+                (after.uncached_bytes_read - before.uncached_bytes_read) as f64 / 1048576.0,
+                cache_before.capacity as f64 / 1048576.0,
+                cache_after.capacity as f64 / 1048576.0,
+                cache_after.min_capacity as f64 / 1048576.0,
+                cache_after.max_capacity as f64 / 1048576.0,
+                after.capacity_changes - before.capacity_changes,
+                cache_after.used as f64 / 1048576.0,
+                cache_after.experts,
+            );
+        }
+        if profile.is_some() {
+            for il in 0..cache_after.layer_count.max(cache_before.layer_count) {
+                let Some(&expert_bytes) = cache_after.layer_expert_bytes.get(&il)
+                    .or_else(|| cache_before.layer_expert_bytes.get(&il)) else { continue };
+                let before = cache_before.layer_counters.get(&il).copied().unwrap_or_default();
+                let after = cache_after.layer_counters.get(&il).copied().unwrap_or_default();
+                let used = cache_after.layer_used.get(&il).copied().unwrap_or(0);
+                let experts = cache_after.layer_experts.get(&il).copied().unwrap_or(0);
+                let quota = cache_after.layer_quota.get(&il).copied().unwrap_or(0);
+                eprintln!(
+                    "GPU prefill layer {il} cache: expert {:.2} MB, bank {:.0} MB, proportional share {:.0} MB, cached {:.0} MB ({} experts); hits {}, misses {}, insertions {}, evictions {}",
+                    expert_bytes as f64 / 1048576.0,
+                    expert_bytes as f64 * self.m.cfg.n_expert as f64 / 1048576.0,
+                    quota as f64 / 1048576.0,
+                    used as f64 / 1048576.0,
+                    experts,
+                    after.hits - before.hits,
+                    after.misses - before.misses,
+                    after.insertions - before.insertions,
+                    after.evictions - before.evictions,
+                );
+            }
+        }
         match self.mtp.as_mut() {
             Some(mh) if fill => mh.pos += t,
             // Row 0 of `x` gets the last hidden state (with the draft head, the copy above did it).
@@ -686,7 +947,7 @@ mod tests {
 
     fn cached_expert() -> CachedExpert {
         CachedExpert {
-            mats: [Arc::from([0u8]), Arc::from([0u8]), Arc::from([0u8])],
+            mats: [MappedBytes::owned(vec![0]), MappedBytes::owned(vec![0]), MappedBytes::owned(vec![0])],
             bytes: 4,
             _reservation: None,
         }
@@ -701,7 +962,7 @@ mod tests {
 
     #[test]
     fn prefill_cache_reclaims_borrowed_share_for_other_layers() {
-        let mut cache = PrefillExpertCache { budget: 16, layer_quota: 8, ..Default::default() };
+        let mut cache = PrefillExpertCache { budget: 16, layer_quota: HashMap::from([(0, 8), (1, 8)]), ..Default::default() };
         insert(&mut cache, (0, 0));
         insert(&mut cache, (0, 1));
         insert(&mut cache, (0, 2));
@@ -713,15 +974,30 @@ mod tests {
     }
 
     #[test]
-    fn prefill_cache_preserves_other_layers_fair_share() {
-        let mut cache = PrefillExpertCache { budget: 16, layer_quota: 8, ..Default::default() };
+    fn prefill_cache_does_not_evict_its_own_entries_to_admit_a_miss() {
+        let mut cache = PrefillExpertCache { budget: 16, layer_quota: HashMap::from([(0, 8), (1, 8)]), ..Default::default() };
         insert(&mut cache, (0, 0));
         insert(&mut cache, (0, 1));
         insert(&mut cache, (1, 0));
         insert(&mut cache, (1, 1));
 
-        assert!(cache.make_room(4, 0));
-        assert_eq!(cache.layer_used.get(&0), Some(&4));
+        assert!(!cache.make_room(4, 0));
+        assert_eq!(cache.layer_used.get(&0), Some(&8));
         assert_eq!(cache.layer_used.get(&1), Some(&8));
+        assert!(cache.entries.contains_key(&(0, 0)));
+        assert!(cache.entries.contains_key(&(0, 1)));
+    }
+
+    #[test]
+    fn prefill_cache_shares_budget_proportionally_to_layer_bank_size() {
+        let bank_bytes = HashMap::from([(0, 1), (1, 3)]);
+        assert_eq!(proportional_layer_quotas(16, &bank_bytes, 4), HashMap::from([(0, 4), (1, 12)]));
+        assert_eq!(proportional_layer_quotas(16, &bank_bytes, 0), HashMap::from([(0, 0), (1, 0)]));
+    }
+
+    #[test]
+    fn staging_runs_keep_their_group_slot_offsets() {
+        let experts = [(2, [0; 3]), (5, [0; 3]), (6, [0; 3]), (11, [0; 3])];
+        assert_eq!(expert_run_offsets(&experts), [(0, 1), (1, 2), (3, 1)]);
     }
 }

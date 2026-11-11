@@ -6,6 +6,7 @@
 
 use crate::model::Model;
 use crate::backend::{Backend, Buf};
+use crate::gguf::MappedBytes;
 use crate::weights::{ExpertCacheReservation, Tensor, available_ram, expert_cache_ram_capacity, expert_cache_ram_state};
 use anyhow::Context;
 use std::borrow::Cow;
@@ -29,7 +30,10 @@ pub const IDS: usize = 32;
 /// Most tokens one request may carry.
 pub const TMAX: usize = 4;
 
-struct CachedExpert { mats: [Box<[u8]>; 3], bytes: usize, _reservation: Option<ExpertCacheReservation> }
+/// Main-thread to worker messages: a token sequence, or a batch of experts to warm in the RAM cache.
+enum WorkerMsg { Token(u32), Promote(Vec<(usize, usize)>) }
+
+struct CachedExpert { mats: [MappedBytes; 3], bytes: usize, _reservation: Option<ExpertCacheReservation> }
 
 #[derive(Default)]
 pub struct CpuExpertCache {
@@ -55,16 +59,14 @@ impl CpuExpertCache {
         };
         let status = available_ram();
         let available = status.map_or(0, |status| status.available);
-        let commit_available = status.and_then(|status| status.commit_available);
         let layer_count = moe_layers.iter().copied().collect::<HashSet<_>>().len();
         let layer_quota = if layer_count == 0 { 0 } else { budget / layer_count };
         eprintln!(
-            "CPU expert RAM cache [{} layers]: LRU enabled for CPU-routed decode misses, initial capacity {:.0} MB ({:.0} MB fair share per layer; unused share is borrowable; {:.0} MB physical, {:.0} MB commit available; reserving 5%; GPU prefill uses separate staging)",
+            "CPU expert RAM cache [{} layers]: file-backed LRU enabled for CPU-routed decode misses, initial physical-RAM budget {:.0} MB ({:.0} MB fair share per layer; unused share is borrowable; {:.0} MB physical available, reserving 5%; commit is not reserved; GPU prefill uses separate staging)",
             layer_count,
             budget as f64 / 1048576.0,
             layer_quota as f64 / 1048576.0,
             available as f64 / 1048576.0,
-            commit_available.unwrap_or(0) as f64 / 1048576.0,
         );
         CpuExpertCache { budget, layer_quota, layer_count, ..CpuExpertCache::default() }
     }
@@ -100,10 +102,10 @@ impl CpuExpertCache {
             };
             let Some(reservation) = reservation else { continue };
 
-            let mats = (|| -> anyhow::Result<[Box<[u8]>; 3]> {
+            let mats = (|| -> anyhow::Result<[MappedBytes; 3]> {
                 let mut mats = Vec::with_capacity(crate::expert_cache::MATS.len());
                 for name in crate::expert_cache::MATS {
-                    mats.push(m.w.expert(il, name, e)?.data.into_owned().into_boxed_slice());
+                    mats.push(m.w.map_expert(il, name, e)?);
                 }
                 mats.try_into().map_err(|_| anyhow::anyhow!("expected three CPU expert matrices"))
             })();
@@ -183,7 +185,7 @@ impl CpuExpertCache {
         let cached = self.entries.get(&(il, e))?;
         let data = cached.mats.get(i)?;
         let (ty, rows, cols, _) = m.w.expert_shape(il, suffix).ok()?;
-        Some(Tensor { ty, rows, cols, data: Cow::Borrowed(data) })
+        Some(Tensor { ty, rows, cols, data: Cow::Borrowed(data.as_ref()) })
     }
 }
 
@@ -206,7 +208,7 @@ pub struct CpuWorker {
     pub layout: Mailbox,
     seq: u32,
     layers: Vec<usize>,
-    tx: Option<mpsc::Sender<u32>>,
+    tx: Option<mpsc::Sender<WorkerMsg>>,
     stop: Arc<AtomicBool>,
     busy_ns: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
@@ -222,7 +224,7 @@ impl CpuWorker {
         let (mem, host) = gpu.host_mailbox(len)?;
         let (host, dev) = (host as usize, mem.addr());
 
-        let (tx, rx) = mpsc::channel::<u32>();
+        let (tx, rx) = mpsc::channel::<WorkerMsg>();
         let (stop, busy_ns) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
         let (st, bn) = (stop.clone(), busy_ns.clone());
         let mp = m as *const Model as usize;
@@ -241,7 +243,21 @@ impl CpuWorker {
             // together keeps storage reads in flight instead of issuing one read at a time per compute thread.
             let pre = crate::weights::Prefetch::start();
             let w = |i: usize| host as *mut u32 as usize + 4 * i;
-            while let Ok(seq) = rx.recv() {
+            while let Ok(msg) = rx.recv() {
+                // VRAM demotions: warm the RAM cache for them now; `prepare` inserts them (or moves them
+                // to the back of the LRU) exactly as a miss of the current batch would.
+                if let WorkerMsg::Promote(promote) = msg {
+                    if !promote.is_empty() {
+                        let by_layer: std::collections::HashMap<usize, Vec<usize>> = promote.into_iter().fold(
+                            std::collections::HashMap::new(),
+                            |mut m, (il, e)| { m.entry(il).or_default().push(e); m });
+                        for (&il, es) in &by_layer {
+                            if let Err(e) = ram_cache.prepare(m, il, es) { panic!("preparing CPU expert RAM cache: {e:#}"); }
+                        }
+                    }
+                    continue;
+                }
+                let seq = match msg { WorkerMsg::Token(seq) => seq, _ => unreachable!() };
                 for &il in &moe_layers {
                     let b = il * lay.stride;
                     let at = |o: usize| (w(b + o)) as *mut u32;
@@ -301,8 +317,14 @@ impl CpuWorker {
     /// Start a new token: returns the sequence number the GPU must publish with.
     pub fn begin(&mut self) -> u32 {
         self.seq = self.seq.wrapping_add(1).max(1);
-        let _ = self.tx.as_ref().unwrap().send(self.seq);
+        let _ = self.tx.as_ref().unwrap().send(WorkerMsg::Token(self.seq));
         self.seq
+    }
+
+    /// Warm the RAM cache for experts demoted from VRAM: their next CPU compute should not read from disk.
+    /// Under mmap the RAM cache is disabled, so this is a no-op there.
+    pub fn promote(&self, demoted: &[(usize, usize)]) {
+        if !demoted.is_empty() { let _ = self.tx.as_ref().unwrap().send(WorkerMsg::Promote(demoted.to_vec())); }
     }
 
     /// Routing of layer `il` from the last finished request, all its tokens: (expert id, routed weight, slot or -1).
@@ -364,7 +386,7 @@ mod tests {
 
     fn expert() -> CachedExpert {
         CachedExpert {
-            mats: [vec![0].into_boxed_slice(), vec![0].into_boxed_slice(), vec![0].into_boxed_slice()],
+            mats: [MappedBytes::owned(vec![0]), MappedBytes::owned(vec![0]), MappedBytes::owned(vec![0])],
             bytes: 4,
             _reservation: None,
         }

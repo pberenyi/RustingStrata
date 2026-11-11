@@ -6,6 +6,8 @@ use std::fs::File;
 use memmap2::Mmap;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 
 use crate::quant::GgmlType;
 
@@ -38,12 +40,59 @@ pub struct TensorInfo { pub name: String, pub dims: Vec<u64>, pub ty: u32, pub o
 pub struct Gguf {
     pub meta: BTreeMap<String, Value>,
     pub tensors: BTreeMap<String, TensorInfo>,
-    /// Each shard's optional map, open file and data offset (one entry unless split).
+    /// Each shard's retained or lazy map, open file and data offset (one entry unless split).
     files: Vec<GgufFile>,
     mmap: bool,
 }
 
-struct GgufFile { mmap: Option<Mmap>, file: File, data_offset: usize }
+struct GgufFile { mmap: Option<Arc<Mmap>>, lazy_mmap: OnceLock<Result<Arc<Mmap>, String>>, file: File, data_offset: usize }
+
+enum MappedStorage {
+    File(Arc<Mmap>),
+    #[cfg(test)]
+    Owned(Arc<[u8]>),
+}
+
+pub struct MappedBytes {
+    storage: MappedStorage,
+    offset: usize,
+    len: usize,
+}
+
+impl MappedBytes {
+    #[cfg(test)]
+    pub(crate) fn owned(bytes: Vec<u8>) -> MappedBytes {
+        let len = bytes.len();
+        MappedBytes { storage: MappedStorage::Owned(Arc::from(bytes)), offset: 0, len }
+    }
+}
+
+impl Deref for MappedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        let data = match &self.storage {
+            MappedStorage::File(mmap) => &mmap[..],
+            #[cfg(test)]
+            MappedStorage::Owned(data) => data,
+        };
+        &data[self.offset..self.offset + self.len]
+    }
+}
+
+impl AsRef<[u8]> for MappedBytes {
+    fn as_ref(&self) -> &[u8] { self }
+}
+
+impl GgufFile {
+    fn mapping(&self) -> anyhow::Result<Arc<Mmap>> {
+        if let Some(mmap) = &self.mmap { return Ok(mmap.clone()); }
+        self.lazy_mmap.get_or_init(|| {
+            unsafe { Mmap::map(&self.file) }
+                .map(Arc::new)
+                .map_err(|err| err.to_string())
+        }).as_ref().map(Arc::clone).map_err(|err| anyhow::anyhow!("map GGUF file for expert cache: {err}"))
+    }
+}
 
 struct Cur<'a> { b: &'a [u8], p: usize }
 
@@ -93,7 +142,8 @@ impl Gguf {
         Self::open_with_mmap(path, true)
     }
 
-    /// Open a GGUF while reading tensor bytes from the files on demand instead of retaining file mappings.
+    /// Open a GGUF, optionally retaining its mapping for normal tensor reads. With mapping disabled, expert cache
+    /// ranges can still create a shared lazy mapping when requested.
     pub fn open_with_mmap(path: &Path, mmap: bool) -> anyhow::Result<Gguf> {
         let mut g = Self::open_one(path, 0, mmap)?;
         g.mmap = mmap;
@@ -144,8 +194,8 @@ impl Gguf {
                 bail!("{}: GGUF truncated (tensor {} lies past the end of the file; re-download it)", path.display(), t.name);
             }
         }
-        let map = keep_mmap.then_some(mmap);
-        Ok(Gguf { meta, tensors, files: vec![GgufFile { mmap: map, file: f, data_offset }], mmap: keep_mmap })
+        let map = keep_mmap.then(|| Arc::new(mmap));
+        Ok(Gguf { meta, tensors, files: vec![GgufFile { mmap: map, lazy_mmap: OnceLock::new(), file: f, data_offset }], mmap: keep_mmap })
     }
 
     pub fn get(&self, key: &str) -> anyhow::Result<&Value> {
@@ -176,6 +226,20 @@ impl Gguf {
         let mut data = vec![0u8; len];
         read_at(&shard.file, &mut data, o as u64)?;
         Ok(Cow::Owned(data))
+    }
+
+    /// Map a tensor byte range from its backing file, retaining a shared whole-file view for reuse by cached experts.
+    pub fn map_bytes_range(&self, t: &TensorInfo, offset: usize, len: usize) -> anyhow::Result<MappedBytes> {
+        let ty = GgmlType::from_u32(t.ty).unwrap();
+        let total = ty.row_bytes(t.dims[0]) * t.dims[1..].iter().product::<u64>() as usize;
+        let end = offset.checked_add(len).context("tensor range overflow")?;
+        anyhow::ensure!(end <= total, "tensor {} range {offset}..{end} exceeds {total} bytes", t.name);
+        let shard = &self.files[t.file];
+        let file_offset = shard.data_offset.checked_add(t.offset as usize).and_then(|x| x.checked_add(offset))
+            .context("GGUF tensor offset overflow")?;
+        let mmap = shard.mapping()?;
+        anyhow::ensure!(file_offset.checked_add(len).is_some_and(|end| end <= mmap.len()), "mapped tensor range exceeds GGUF file");
+        Ok(MappedBytes { storage: MappedStorage::File(mmap), offset: file_offset, len })
     }
 }
 

@@ -52,7 +52,12 @@ fn parses_synthetic_file() {
     let range = g2.bytes_range(t, 8, 8).unwrap();
     assert_eq!(f32::from_le_bytes(range[0..4].try_into().unwrap()), 3.0);
     assert_eq!(f32::from_le_bytes(range[4..8].try_into().unwrap()), 4.0);
+    let mapped = g2.map_bytes_range(t, 8, 8).unwrap();
+    assert_eq!(f32::from_le_bytes(mapped[0..4].try_into().unwrap()), 3.0);
+    assert_eq!(f32::from_le_bytes(mapped[4..8].try_into().unwrap()), 4.0);
     drop(g2);
+    assert_eq!(f32::from_le_bytes(mapped[4..8].try_into().unwrap()), 4.0);
+    drop(mapped);
     std::fs::remove_file(&p).ok();
     std::fs::remove_file(&cut).ok();
 }

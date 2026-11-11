@@ -156,7 +156,7 @@ These options are accepted by `score`, `chat`, `serve`, `bench`, `perplexity`, a
 | Option | Default | Description |
 |---|---|---|
 | `--gpu` | Off | Run on a GPU; experts that do not fit in VRAM run on the CPU. Without it, use the CPU reference. |
-| `--no-mmap` | Off | Read GGUF tensors on demand instead of retaining file mappings; lowers working-set memory. With `--gpu`, CPU-routed decode experts and GPU-prefill staging experts share a RAM cache that rechecks available physical memory and commit headroom as it fills, reserving 5% of each. |
+| `--no-mmap` | Off | Read ordinary GGUF tensors on demand instead of eagerly retaining a model mapping. With `--gpu`, CPU-routed decode and GPU-prefill caches lazily use file-backed expert mappings, with a startup budget from available physical RAM minus a 5% reserve; Windows may reclaim mapped pages under memory pressure. |
 | `--ctx N` | `4096` | GPU context length / KV-cache size, in tokens. |
 | `--chunk N` | Calibrated, else `4096` | GPU prefill chunk size in tokens; `0` processes tokens one at a time. |
 | `--vram-margin MB` | `512` | VRAM to leave free after placing expert layers. |
@@ -179,6 +179,12 @@ Defaults for `--chunk`, `--mtp`, and `--threads` use the calibration file when a
 or refresh it; explicitly passing the corresponding option overrides the saved value. MTP is disabled on CPU and
 when multiple GPUs split the model. Multiple GPUs split layers by free VRAM; they provide more memory, not twice
 the speed. MTP drafting is unavailable for split models.
+
+Set `STRATA_PREFILL_PROFILE=1` to emit per-chunk timings for GPU prefill. This diagnostic synchronizes the GPU at
+chunk boundaries, so it changes throughput. Expert-range and host-upload timings are host-side durations: mapped
+page faults may occur in either, and asynchronous uploads do not measure device-copy or kernel time separately.
+With no-mmap, profiling also reports per-layer expert-bank size, proportional-share budget, cached experts, and cache
+hits/misses/insertions/evictions for each chunk.
 
 #### Command-specific options
 

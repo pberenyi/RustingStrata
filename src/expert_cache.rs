@@ -210,33 +210,25 @@ impl ExpertCache {
     }
 
     /// Decay counts, then per pool swap up to `max_swaps` cold residents for clearly hotter missed experts.
-    pub fn adapt(&mut self, m: &Model, gpu: &dyn Backend, max_swaps: usize) -> anyhow::Result<()> {
-        if self.profile.is_none() { return Ok(()); }
+    /// Returns the `(layer, expert)` pairs demoted from VRAM so the no-mmap path can warm their CPU copies.
+    pub fn adapt(&mut self, m: &Model, gpu: &dyn Backend, max_swaps: usize) -> anyhow::Result<Vec<(usize, usize)>> {
+        if self.profile.is_none() { return Ok(Vec::new()); }
         for c in &mut self.counts { *c *= KEEP; }
         for c in &mut self.long { *c *= LONG_KEEP; }
-        let n = self.n_expert;
-        for p in 0..self.pools.len() {
-            let mut hot: Vec<usize> = (0..self.counts.len())
-                .filter(|&i| self.layers[i / n].as_ref().is_some_and(|l| l.pool == p && l.table[i % n] < 0)).collect();
-            smallest(&mut hot, max_swaps, |&a, &b| self.counts[b].total_cmp(&self.counts[a]));
-            let mut cold: Vec<usize> = (0..self.pools[p].owner.len()).collect();
-            let cnt = |s: usize, me: &Self| { let (il, e) = me.pools[p].owner[s]; me.counts[il * n + e] };
-            smallest(&mut cold, max_swaps, |&a, &b| cnt(a, self).total_cmp(&cnt(b, self)));
-            let mut touched = Vec::new();
-            for (&h, &slot) in hot.iter().zip(&cold).take(max_swaps) {
-                if self.counts[h] < 1.5 * cnt(slot, self) + 2.0 { break; }
-                let (oil, oe) = self.pools[p].owner[slot];
-                self.layers[oil].as_mut().unwrap().table[oe] = -1;
-                self.pools[p].owner[slot] = (h / n, h % n);
-                self.place(m, gpu, h / n, h % n, slot, false)?;
-                touched.extend([oil, h / n]);
-                self.swaps += 1;
-            }
-            touched.sort();
-            touched.dedup();
-            for il in touched { self.sync_table(gpu, il)?; }
+        let plan = plan_swaps(&self.layers, &self.pools, &self.counts, self.n_expert, max_swaps);
+        let mut demoted = Vec::new();
+        for &((oil, oe), (nl, ne), p, slot) in &plan {
+            self.layers[oil].as_mut().unwrap().table[oe] = -1;
+            self.pools[p].owner[slot] = (nl, ne);
+            self.place(m, gpu, nl, ne, slot, false)?;
+            demoted.push((oil, oe));
+            self.swaps += 1;
         }
-        Ok(())
+        let mut touched: Vec<usize> = plan.iter().flat_map(|((oil, _), (nl, _), _, _)| [*oil, *nl]).collect();
+        touched.sort();
+        touched.dedup();
+        for il in touched { self.sync_table(gpu, il)?; }
+        Ok(demoted)
     }
 
     pub fn save_profile(&self) -> anyhow::Result<()> {
@@ -264,6 +256,32 @@ fn profile_update(existing: &[f32], n_expert: usize, long: &[f32], moe: &[bool])
         if held { all[il * n_expert..(il + 1) * n_expert].copy_from_slice(&long[il * n_expert..(il + 1) * n_expert]); }
     }
     all
+}
+
+/// The swap plan `adapt` executes: per pool, up to `max_swaps` tuples of (demoted resident, promoted
+/// missed expert, pool, slot) where the missed expert is clearly hotter. Pure, so the demotion decision is
+/// tested without a device; the caller performs the placement and table sync.
+fn plan_swaps(layers: &[Option<LayerExperts>], pools: &[Pool], counts: &[f32], n: usize, max_swaps: usize)
+    -> Vec<((usize, usize), (usize, usize), usize, usize)>
+{
+    let mut plan = Vec::new();
+    for p in 0..pools.len() {
+        let mut hot: Vec<usize> = (0..counts.len())
+            .filter(|&i| layers[i / n].as_ref().is_some_and(|l| l.pool == p && l.table[i % n] < 0)).collect();
+        smallest(&mut hot, max_swaps, |&a, &b| counts[b].total_cmp(&counts[a]));
+        let mut cold: Vec<usize> = (0..pools[p].owner.len()).collect();
+        smallest(&mut cold, max_swaps, |&a, &b| {
+            let (ail, ae) = pools[p].owner[a];
+            let (bil, be) = pools[p].owner[b];
+            counts[ail * n + ae].total_cmp(&counts[bil * n + be])
+        });
+        for (&h, &slot) in hot.iter().zip(&cold).take(max_swaps) {
+            let (cl, ce) = pools[p].owner[slot];
+            if counts[h] < 1.5 * counts[cl * n + ce] + 2.0 { break; }
+            plan.push(((cl, ce), (h / n, h % n), p, slot));
+        }
+    }
+    plan
 }
 
 /// Keeps the `k` first elements of `v` in the order a stable sort by `cmp` gives, without sorting all of `v`.
@@ -319,6 +337,27 @@ mod tests {
         assert_eq!(c.active_set_bytes(0, 8), 8 * 128);
         assert_eq!(c.active_set_bytes(9, 8), 0, "a layer outside the cache reads nothing");
         assert_eq!(c.token_bytes(8), 3 * 8 * 128);
+    }
+
+    /// Regression: a missed expert clearly hotter than a cold resident is promoted, demoting the resident
+    /// (which `adapt` returns so the no-mmap path can warm its CPU copy).
+    #[test]
+    fn adapt_demotes_cold_resident_for_hotter_missed_expert() {
+        let mut c = fake(2, 4, 2, Some(PathBuf::from("profile")));  // 2 experts resident per layer
+        c.counts[0 * 4 + 2] = 100.0;  // layer 0, expert 2: missed and hot
+        c.counts[0 * 4 + 0] = 0.0;    // layer 0, expert 0: resident and cold
+        let plan = plan_swaps(&c.layers, &c.pools, &c.counts, c.n_expert, 2);
+        assert_eq!(plan, vec![((0, 0), (0, 2), 0, 0)],
+            "the hot missed expert (0,2) should displace the cold resident (0,0)");
+    }
+
+    /// Regression: a missed expert whose count is below the 2.0 floor does not displace its resident peer.
+    #[test]
+    fn adapt_leaves_close_counts_undisturbed() {
+        let mut c = fake(2, 4, 2, Some(PathBuf::from("profile")));
+        c.counts[0 * 4 + 2] = 1.0;  // missed expert; 1.0 < 1.5*0 + 2.0, so no swap
+        let plan = plan_swaps(&c.layers, &c.pools, &c.counts, c.n_expert, 2);
+        assert!(plan.is_empty(), "a count below the 2.0 floor must not trigger a swap: {plan:?}");
     }
 
     /// R2b: a fully resident run records nothing, so `save_profile` must leave the file as it was (no zeroing of a
