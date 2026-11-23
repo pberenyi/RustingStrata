@@ -29,7 +29,7 @@ fn gq_min(pos: usize, nt: usize) -> i32 {
 }
 
 
-mod prefill;
+pub mod prefill;
 
 /// A tensor `GpuModel::load_part` never uploads: the PLE table stays on the CPU.
 fn cpu_only(name: &str) -> bool { name == "per_layer_token_embd.weight" }
@@ -206,6 +206,8 @@ pub struct GpuModel<'a> {
     pub split_time: (Duration, Duration),
     /// MTP drafts per speculative step (0 = no draft head). May be lowered after `load`, never raised.
     pub k: usize,
+    /// Per-token MoE routing observed during prefill (calibration study: token-bitset consistency).
+    pub token_routing: Option<prefill::TokenRouting>,
     /// Prompts shorter than this go through `step` instead of the batched prefill.
     pub short: usize,
     /// Prefill scratch (None: prompts go through `step`).
@@ -418,7 +420,7 @@ impl<'a> GpuModel<'a> {
         let pids = if prefetch { Some(gpu.zeros::<i32>((c.n_layer + 1) * c.n_expert_used)?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
-            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens{}, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
+            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens{}, prefill {:.0} MB), expert VRAM pool {:.0} MB, resident experts {}/{}",
             mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()),
             if ns > 1 { format!(" in each of {ns} slots") } else { String::new() }, mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
@@ -429,7 +431,7 @@ impl<'a> GpuModel<'a> {
         if let Some(ca) = &cache {
             let k = c.n_expert_used;
             let per = (0..ca.layers_len()).map(|il| ca.active_set_bytes(il, k)).max().unwrap_or(0);
-            eprintln!("expert traffic: {:.1} MB per layer active set (top-{k}), {:.1} MB per token over {} MoE layers{}",
+            eprintln!("VRAM expert traffic: {:.1} MB per layer active set (top-{k}), {:.1} MB per token over {} MoE layers{}",
                 mb(per), mb(ca.token_bytes(k)), ca.total_experts() / c.n_expert.max(1),
                 if prefetch { ", next-layer L2 prefetch on (STRATA_MOE_PREFETCH)" } else { "" });
         }
@@ -440,7 +442,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, token_routing: None, short: 32, pf, mtp, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
@@ -546,6 +548,9 @@ impl<'a> GpuModel<'a> {
 
     /// This part and the parts after it.
     pub fn parts(&self) -> impl Iterator<Item = &GpuModel<'a>> { std::iter::successors(Some(self), |p| p.next.as_deref()) }
+
+    /// Number of experts in this part's host-RAM prefill cache (0 when there is no prefill scratch).
+    pub fn ram_cache_experts(&self) -> usize { self.pf.as_ref().map_or(0, |p| p.ram_cache_experts()) }
 
     /// The part that computes the logits.
     fn tail(&self) -> &GpuModel<'a> { self.parts().last().unwrap() }

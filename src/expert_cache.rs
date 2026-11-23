@@ -5,7 +5,7 @@
 use crate::backend::{Backend, Buf};
 use crate::model::Model;
 use crate::quant::GgmlType;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 /// Share of each count kept per `adapt` (every 8 tokens by default): `counts` and `long`.
@@ -41,6 +41,9 @@ pub struct ExpertCache {
     /// Whether `record` ran since the load: a fully resident run records nothing and must not rewrite the profile.
     recorded: bool,
     pub swaps: usize,
+    /// Unique `(layer, expert)` pairs routed since load: the GPU-side working set, for per-layer
+    /// working-set reporting (option C: measure-only, no placement change).
+    seen: HashSet<(usize, usize)>,
 }
 
 /// Where routing profiles and calibration files live: `$XDG_CACHE_HOME`, `%LOCALAPPDATA%` on Windows, else
@@ -117,7 +120,7 @@ impl ExpertCache {
                 }),
             });
         }
-        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, long, profile, recorded: false, swaps: 0 };
+        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, long, profile, recorded: false, swaps: 0, seen: HashSet::new() };
         // Initial fill: hottest first by profile; ties (and no profile) keep layer order.
         let mut order: Vec<usize> = (0..n_layers * n).filter(|&i| cache.layers[i / n].is_some()).collect();
         order.sort_by(|&a, &b| cache.counts[b].total_cmp(&cache.counts[a]).then(a.cmp(&b)));
@@ -204,9 +207,21 @@ impl ExpertCache {
     pub fn record(&mut self, il: usize, ids: &[i32]) {
         self.recorded = true;
         for &e in ids {
-            self.counts[il * self.n_expert + e as usize] += 1.0;
-            self.long[il * self.n_expert + e as usize] += 1.0;
+            let idx = il * self.n_expert + e as usize;
+            self.counts[idx] += 1.0;
+            self.long[idx] += 1.0;
+            self.seen.insert((il, e as usize));
         }
+    }
+
+    /// Number of unique experts routed for layer `il` (the GPU-side working-set size).
+    pub fn seen_per_layer(&self, il: usize) -> usize {
+        self.seen.iter().filter(|&&(l, _)| l == il).count()
+    }
+
+    /// Number of experts currently resident in VRAM for layer `il`.
+    pub fn resident_per_layer(&self, il: usize) -> usize {
+        self.layers.get(il).map_or(0, |l| l.as_ref().map_or(0, |l| l.table.iter().filter(|&&s| s >= 0).count()))
     }
 
     /// Decay counts, then per pool swap up to `max_swaps` cold residents for clearly hotter missed experts.
@@ -310,7 +325,7 @@ mod tests {
             table_dev: Buf::new(0, 4 * n, ()),
         })).collect();
         let mut c = ExpertCache { pools: vec![pool], layers: ls, n_expert: n, counts: vec![0.0; layers * n],
-            long: vec![0.0; layers * n], profile, recorded: false, swaps: 0 };
+            long: vec![0.0; layers * n], profile, recorded: false, swaps: 0, seen: HashSet::new() };
         for il in 0..layers {
             for e in 0..resident {
                 c.pools[0].owner.push((il, e));
@@ -349,6 +364,26 @@ mod tests {
         let plan = plan_swaps(&c.layers, &c.pools, &c.counts, c.n_expert, 2);
         assert_eq!(plan, vec![((0, 0), (0, 2), 0, 0)],
             "the hot missed expert (0,2) should displace the cold resident (0,0)");
+    }
+
+    /// Option C: `record` accumulates the unique `(layer, expert)` working set per layer, and
+    /// `resident_per_layer` reports the VRAM-resident count. Measure-only: no placement change.
+    #[test]
+    fn record_tracks_per_layer_working_set() {
+        let mut c = fake(2, 4, 2, None);  // 2 experts resident per layer
+        assert_eq!(c.seen_per_layer(0), 0, "no routing recorded yet");
+        assert_eq!(c.resident_per_layer(0), 2);
+        // Route experts 0 and 1 (both already resident) twice: the unique set stays {0,1}.
+        c.record(0, &[0, 1]);
+        c.record(0, &[0, 1]);
+        assert_eq!(c.seen_per_layer(0), 2, "duplicate routing does not grow the unique set");
+        // Route a missed expert (2) in layer 1.
+        c.record(1, &[2]);
+        assert_eq!(c.seen_per_layer(1), 1);
+        assert_eq!(c.resident_per_layer(1), 2, "recording a miss does not change residency");
+        // A layer outside the cache reports nothing.
+        assert_eq!(c.seen_per_layer(9), 0);
+        assert_eq!(c.resident_per_layer(9), 0);
     }
 
     /// Regression: a missed expert whose count is below the 2.0 floor does not displace its resident peer.

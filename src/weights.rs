@@ -349,7 +349,12 @@ pub(crate) fn available_ram() -> Option<RamStatus> {
 pub(crate) fn available_ram() -> Option<RamStatus> { None }
 
 struct ExpertCacheRam {
-    capacity: usize,
+    // Current effective physical-RAM capacity. Starts at the free-RAM envelope and is lowered by
+    // the fault-based adaptive cap (and STRATA_EXPERT_RAM_MB at init). Both the GPU prefill and
+    // CPU expert caches draw from this shared pool, so capping it bounds total touched pages.
+    capacity: AtomicUsize,
+    // Upper bound the adaptive cap may grow back to (the free-RAM envelope at startup).
+    max_capacity: usize,
     used: AtomicUsize,
 }
 
@@ -364,26 +369,48 @@ fn expert_cache_ram() -> Option<&'static ExpertCacheRam> {
     EXPERT_CACHE_RAM.get_or_init(|| {
         let status = available_ram()?;
         let capacity = expert_cache_capacity(status)?;
-        Some(ExpertCacheRam { capacity, used: AtomicUsize::new(0) })
+        // STRATA_EXPERT_RAM_MB caps the shared physical-RAM capacity (both the GPU prefill and
+        // CPU caches draw from it), so runs place the same total RAM cache whatever RAM is free.
+        let cap = std::env::var("STRATA_EXPERT_RAM_MB").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v << 20)
+            .unwrap_or(usize::MAX);
+        let capacity = capacity.min(cap);
+        Some(ExpertCacheRam {
+            capacity: AtomicUsize::new(capacity),
+            max_capacity: capacity,
+            used: AtomicUsize::new(0),
+        })
     }).as_ref()
 }
 
 pub(crate) fn expert_cache_ram_capacity() -> Option<usize> {
-    expert_cache_ram().map(|state| state.capacity)
+    expert_cache_ram().map(|state| state.capacity.load(Ordering::Acquire))
 }
 
 pub(crate) fn expert_cache_ram_state() -> Option<(usize, usize)> {
     let state = expert_cache_ram()?;
+    let capacity = state.capacity.load(Ordering::Acquire);
     let used = state.used.load(Ordering::Acquire);
-    Some((state.capacity, used))
+    Some((capacity, used))
+}
+
+/// Set the shared physical-RAM capacity (the fault-based adaptive cap), clamped to the startup
+/// free-RAM envelope. Both expert caches pick the new capacity up on their next refresh, and the
+/// reservation gate enforces it for new insertions.
+pub(crate) fn expert_cache_ram_set_capacity(capacity: usize) {
+    if let Some(state) = expert_cache_ram() {
+        state.capacity.store(capacity.min(state.max_capacity), Ordering::Release);
+    }
 }
 
 fn reserve_expert_cache_ram(bytes: usize) -> bool {
     let Some(state) = expert_cache_ram() else { return false };
+    let capacity = state.capacity.load(Ordering::Acquire);
     let mut current = state.used.load(Ordering::Relaxed);
     loop {
         let Some(next) = current.checked_add(bytes) else { return false };
-        if next > state.capacity {
+        if next > capacity {
             return false;
         }
         match state.used.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {

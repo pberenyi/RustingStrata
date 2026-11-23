@@ -44,7 +44,6 @@ pub struct CpuExpertCache {
     layer_quota: usize,
     layer_count: usize,
     layer_used: HashMap<usize, usize>,
-    reported_bucket: Option<(usize, usize)>,
 }
 
 impl CpuExpertCache {
@@ -117,17 +116,6 @@ impl CpuExpertCache {
             self.lru.push_back(key);
             self.used += size;
             *self.layer_used.entry(il).or_default() += size;
-        }
-        let bucket = (self.used / (128 << 20), self.budget / (128 << 20));
-        if self.used > 0 && self.reported_bucket != Some(bucket) {
-            eprintln!(
-                "CPU expert RAM cache [{} layers]: {:.0} MB in use / {:.0} MB current capacity ({} experts cached)",
-                self.layer_count,
-                self.used as f64 / 1048576.0,
-                self.budget as f64 / 1048576.0,
-                self.entries.len(),
-            );
-            self.reported_bucket = Some(bucket);
         }
         Ok(())
     }

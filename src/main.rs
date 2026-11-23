@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use anyhow::Context;
 use rusting_strata::model::{Model, State};
-use rusting_strata::{backend, gpu_model::GpuModel};
+use rusting_strata::{backend, gpu_model::{prefill, GpuModel}};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
 use rusting_strata::chat::{Hold, Msg, Template};
 use serde_json::json;
@@ -221,6 +221,39 @@ impl Runner<'_> {
                 else if st.all_fast { format!("fast path on, {}/{} experts resident", st.resident, st.total) }
                 else { format!("fast path off, {}/{} experts resident", st.resident, st.total) };
             eprintln!("mailbox traffic: {} GPU writes, {} host routing reads ({mode})", sum(&|p| p.mailbox_writes.get()), sum(&|p| p.mailbox_reads.get()));
+            // Option C: per-layer GPU working set (unique experts routed) vs VRAM residency, so the
+            // calibration log shows whether the per-layer demand varies enough to justify a dynamic
+            // slot quota (option A) before any placement change is made.
+            for (pi, p) in g.parts().enumerate() {
+                if let Some(c) = &p.cache {
+                    let n = c.layers_len();
+                    let seen: Vec<usize> = (0..n).map(|il| c.seen_per_layer(il)).filter(|&s| s > 0).collect();
+                    let cov: Vec<f64> = (0..n)
+                        .map(|il| {
+                            let s = c.seen_per_layer(il);
+                            if s == 0 { 0.0 } else { c.resident_per_layer(il) as f64 / s as f64 * 100.0 }
+                        })
+                        .filter(|&s| s > 0.0)
+                        .collect();
+                    if seen.is_empty() { continue; }
+                    let avg = seen.iter().sum::<usize>() as f64 / seen.len() as f64;
+                    let seen_total: usize = seen.iter().sum();
+                    let resident = c.resident_count();
+                    let ram = p.ram_cache_experts();
+                    let vram_pct = if seen_total > 0 { resident as f64 / seen_total as f64 * 100.0 } else { 0.0 };
+                    let ram_pct = if seen_total > 0 { ram as f64 / seen_total as f64 * 100.0 } else { 0.0 };
+                    eprintln!(
+                        "part {pi} VRAM expert working set (decode): seen/layer {}-{} (avg {:.0}), VRAM resident/seen {:.0}-{}% ({} MoE layers)",
+                        seen.iter().min().unwrap(), seen.iter().max().unwrap(), avg,
+                        cov.iter().copied().fold(f64::MAX, f64::min),
+                        cov.iter().copied().fold(0.0, f64::max),
+                        seen.len(),
+                    );
+                    eprintln!(
+                        "part {pi} expert utilization: working set {seen_total}, VRAM resident {resident} ({vram_pct:.0}%), RAM cached {ram} ({ram_pct:.0}%)",
+                    );
+                }
+            }
             for p in g.parts() { if let Some(c) = &p.cache { c.save_profile()?; } }
         }
         Ok(())
@@ -261,6 +294,7 @@ impl Engine {
         for n in notes { eprintln!("{n}"); }
         (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
+        let be = bk[0].name(); // captured before `load_split` takes the backends
         // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
         let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
@@ -272,6 +306,18 @@ impl Engine {
         };
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
+        // Warm start for the prefill expert cache: the `TokenRouting` a previous `calibrate`
+        // persisted (prediction + consistency). Missing or malformed file -> empty table,
+        // which degrades to the live-only behaviour.
+        let rp = routing_path(model, &be);
+        g.token_routing = Some(
+            std::fs::read(&rp).ok()
+                .and_then(|b| prefill::TokenRouting::deserialize(&b))
+                .unwrap_or_else(|| prefill::TokenRouting::new(m.cfg.n_expert, m.cfg.n_expert_used)),
+        );
+        let n = g.token_routing.as_ref().unwrap().map.len();
+        if n == 0 { eprintln!("routing: no seed table, building live"); }
+        else { eprintln!("routing: {n} tokens from {}", rp.display()); }
         Ok(Runner::Gpu(Box::new(g)))
     }
     fn sampler(&self) -> Sampler {
@@ -336,6 +382,15 @@ fn calibration_path(model: &Path, backend: &str) -> PathBuf {
     let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
     rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}.json"))
+}
+
+/// Live routing-consistency seed table for `model` on `backend`: the `TokenRouting`
+/// the `calibrate` path persists and a later run loads as the warm start for the
+/// prefill expert-cache prediction. Same naming as `calibration_path`, `.bin` suffix.
+fn routing_path(model: &Path, backend: &str) -> PathBuf {
+    let stem = model.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    let sfx = if backend == "cuda" { String::new() } else { format!("-{backend}") };
+    rusting_strata::expert_cache::cache_dir().join(format!("strata-{stem}{sfx}-routing.bin"))
 }
 
 impl Engine {
@@ -1073,32 +1128,77 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
         let mut gm = GpuModel::load(&m, backend::open(kind, device)?, ctx, chunk, margin, 3).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
+        // Warm-start the routing table from a previous calibrate's persisted seed,
+        // so C2 protection masks are populated during the timed runs. Without this,
+        // the table is empty and C2 degrades to plain LRU (the masks are all-zero).
+        // Missing or malformed file -> empty table (first calibrate pass builds it).
+        let rp = routing_path(model, kind.unwrap_or("cuda"));
+        gm.token_routing = Some(
+            std::fs::read(&rp).ok()
+                .and_then(|b| prefill::TokenRouting::deserialize(&b))
+                .unwrap_or_else(|| prefill::TokenRouting::new(m.cfg.n_expert, m.cfg.n_expert_used)),
+        );
         Ok(gm)
     };
 
+    // TEMPORARILY SHORTENED: 512 + 4096 chunk + decode, to measure cache methods faster.
+    // The other chunks and short-prompt runs are commented out; restore once measured.
     let mut chunk = (0, 0.0);
-    for c in [512, 1024, 2048, 4096].into_iter().filter(|&c| c <= ctx) {
+    let mut routing = prefill::TokenRouting::new(m.cfg.n_expert, m.cfg.n_expert_used);
+    // for c in [512, 1024, 2048, 4096].into_iter().filter(|&c| c <= ctx) {
+    for c in [512, 4096].into_iter().filter(|&c| c <= ctx) {
         eprintln!("calibrate: loading prefill chunk {c} ({n_pf} prompt tokens)");
         // A larger chunk's prefill scratch may not fit beside a long --ctx: keep the chunks measured so far.
         let mut gm = match load(c) { Ok(gm) => gm, Err(e) if chunk.0 > 0 => { eprintln!("chunk {c:5}: {e:#}"); break } Err(e) => return Err(e) };
-        let t = best(&format!("chunk {c}, prefill"), &mut || { gm.reset()?; gm.prefill(&pf).map(drop) })?;
+        let t = best(&format!("chunk {c}, prefill"), &mut || { gm.reset()?; gm.prefill(&pf)?; Ok(()) })?;
         let tps = n_pf as f64 / t;
         eprintln!("chunk {c:5}: prefill {n_pf} tok {tps:.0} tok/s");
         if tps > chunk.1 { chunk = (c, tps); }
+        if let Some(tr) = gm.token_routing.take() { routing.merge(&tr); }
+    }
+    // }
+
+    // Token routing consistency floor: for each layer, the average over tokens of
+    // `popcount(cons_set) / top_k` — the fraction of each token's top-k experts present
+    // in *every* recorded occurrence. This is the live consistency floor the cache sizing
+    // policy reads, matching the simulation's consistency-floor table.
+    if !routing.map.is_empty() {
+        let cons = routing.layer_consistency(m.cfg.n_layer);
+        eprintln!("\n=== Token Routing Consistency Floor (per-layer, calibration prompt) ===");
+        for (layer, &score) in cons.iter().enumerate() {
+            if score > 0.0 {
+                eprintln!("layer {:3}: consistency {:.2}", layer, score);
+            }
+        }
+        let active: Vec<f64> = cons.iter().copied().filter(|&s| s > 0.0).collect();
+        if !active.is_empty() {
+            eprintln!("Average consistency: {:.2}", active.iter().sum::<f64>() / active.len() as f64);
+        }
+        // Persist the live routing table as the warm-start seed for later runs: the
+        // prediction (union_set) and consistency (cons_set) both carry over, so the next
+        // `run` begins with a populated prediction table. `freq` is runtime-only.
+        let path = routing_path(model, kind.unwrap_or("cuda"));
+        match std::fs::write(&path, routing.serialize()) {
+            Ok(()) => eprintln!("routing table: {} tokens -> {}", routing.map.len(), path.display()),
+            Err(e) => eprintln!("routing table: failed to write {}: {e:#}", path.display()),
+        }
     }
 
-    let mut gm = load(chunk.0)?;
-    let mut short = usize::MAX;
-    for n in [8, 16, 32, 64, 128] {
-        let p = &pf[..n];
-        gm.short = usize::MAX;
-        let ts = best(&format!("prompt {n}, token-by-token"), &mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
-        gm.short = 0;
-        let tb = best(&format!("prompt {n}, batched"), &mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
-        eprintln!("prompt {n:4}: steps {:.1} ms, batched {:.1} ms", ts * 1e3, tb * 1e3);
-        if tb < ts && short == usize::MAX { short = n; }
-    }
-    if short == usize::MAX { short = 256; }
+    // `mut` is needed only while the short-prompt loop below is active (it sets `gm.short`);
+    // restore `mut` when that section is un-commented.
+    let gm = load(chunk.0)?;
+    // let mut short = usize::MAX;
+    // for n in [8, 16, 32, 64, 128] {
+    //     let p = &pf[..n];
+    //     gm.short = usize::MAX;
+    //     let ts = best(&format!("prompt {n}, token-by-token"), &mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
+    //     gm.short = 0;
+    //     let tb = best(&format!("prompt {n}, batched"), &mut || { gm.reset()?; gm.prefill(p).map(drop) })?;
+    //     eprintln!("prompt {n:4}: steps {:.1} ms, batched {:.1} ms", ts * 1e3, tb * 1e3);
+    //     if tb < ts && short == usize::MAX { short = n; }
+    // }
+    // if short == usize::MAX { short = 256; }
+    let short = 256;
 
     let dec = tok.encode("Write a long story about a dragon.")?;
     let kmax = gm.k;
@@ -1120,6 +1220,38 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     }
 
     let Runner::Gpu(g) = &r else { unreachable!() };
+    // Option C: per-layer GPU working set (unique experts routed) vs VRAM residency. `calibrate` never calls
+    // `Runner::finish()`, so print it here; `seen` accumulated over the prefill and decode runs above.
+    for (pi, p) in g.parts().enumerate() {
+        if let Some(c) = &p.cache {
+            let n = c.layers_len();
+            let seen: Vec<usize> = (0..n).map(|il| c.seen_per_layer(il)).filter(|&s| s > 0).collect();
+            if seen.is_empty() { continue; }
+            let avg = seen.iter().sum::<usize>() as f64 / seen.len() as f64;
+            let cov: Vec<f64> = (0..n)
+                .map(|il| {
+                    let s = c.seen_per_layer(il);
+                    if s == 0 { 0.0 } else { c.resident_per_layer(il) as f64 / s as f64 * 100.0 }
+                })
+                .filter(|&s| s > 0.0)
+                .collect();
+            let seen_total: usize = seen.iter().sum();
+            let resident = c.resident_count();
+            let ram = p.ram_cache_experts();
+            let vram_pct = if seen_total > 0 { resident as f64 / seen_total as f64 * 100.0 } else { 0.0 };
+            let ram_pct = if seen_total > 0 { ram as f64 / seen_total as f64 * 100.0 } else { 0.0 };
+            eprintln!(
+                "part {pi} VRAM expert working set (decode): seen/layer {}-{} (avg {:.0}), VRAM resident/seen {:.0}-{}% ({} MoE layers)",
+                seen.iter().min().unwrap(), seen.iter().max().unwrap(), avg,
+                cov.iter().copied().fold(f64::MAX, f64::min),
+                cov.iter().copied().fold(0.0, f64::max),
+                seen.len(),
+            );
+            eprintln!(
+                "part {pi} expert utilization: working set {seen_total}, VRAM resident {resident} ({vram_pct:.0}%), RAM cached {ram} ({ram_pct:.0}%)",
+            );
+        }
+    }
     let path = calibration_path(model, g.gpu.name());
     std::fs::create_dir_all(path.parent().unwrap())?;
     let v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx,
